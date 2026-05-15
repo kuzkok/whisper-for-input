@@ -1,35 +1,89 @@
 """
-Resident Whisper HTTP server.
-Loads the model once at startup, accepts audio via POST /transcribe.
+Resident WhisperX HTTP server.
+
+Endpoints:
+  POST /transcribe  — fast transcription, no diarization. Used by voice-input.
+  POST /diarize     — full WhisperX pipeline: transcribe + word-align + speaker diarize.
+  GET  /health
 """
 import os
 import tempfile
 from contextlib import asynccontextmanager
 
-import whisper
+import whisperx
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse
 
-MODEL_NAME = os.environ.get("WHISPER_MODEL", "turbo")
+MODEL_NAME = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
 DEVICE = os.environ.get("WHISPER_DEVICE", "cuda")
+COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "int8_float16")
+BATCH_SIZE = int(os.environ.get("WHISPER_BATCH_SIZE", "16"))
 INITIAL_PROMPT = os.environ.get(
     "WHISPER_INITIAL_PROMPT",
     "Разработчик диктует команды и заметки. Используй правильную пунктуацию. Английские термины пиши латиницей: git, deploy, branch, merge, commit, docker, kubernetes, API, SQL.",
 )
+PRELOAD_DIARIZE = os.environ.get("WHISPERX_PRELOAD_DIARIZE", "0") == "1"
+
+# All HF models are pre-downloaded on the host via download-models.sh.
+# The container runs with HF_HUB_OFFLINE=1, so no auth token is needed at runtime.
 
 _model = None
+_align_models = {}        # cached per language code: {lang: (model, metadata)}
+_diarize_pipeline = None
+
+
+def get_align_model(lang_code):
+    if lang_code not in _align_models:
+        print(f"Loading alignment model for language '{lang_code}'...", flush=True)
+        align_model, metadata = whisperx.load_align_model(language_code=lang_code, device=DEVICE)
+        _align_models[lang_code] = (align_model, metadata)
+    return _align_models[lang_code]
+
+
+def get_diarize_pipeline():
+    global _diarize_pipeline
+    if _diarize_pipeline is None:
+        print("Loading pyannote diarization pipeline...", flush=True)
+        _diarize_pipeline = whisperx.DiarizationPipeline(use_auth_token=None, device=DEVICE)
+        print("Diarization pipeline ready.", flush=True)
+    return _diarize_pipeline
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _model
-    print(f"Loading Whisper model '{MODEL_NAME}' on {DEVICE}...", flush=True)
-    _model = whisper.load_model(MODEL_NAME, device=DEVICE)
-    print("Model ready.", flush=True)
+    print(
+        f"Loading WhisperX model '{MODEL_NAME}' on {DEVICE} ({COMPUTE_TYPE})...",
+        flush=True,
+    )
+    asr_options = {"initial_prompt": INITIAL_PROMPT} if INITIAL_PROMPT else {}
+    _model = whisperx.load_model(
+        MODEL_NAME,
+        device=DEVICE,
+        compute_type=COMPUTE_TYPE,
+        asr_options=asr_options,
+    )
+    print("Transcribe model ready.", flush=True)
+    if PRELOAD_DIARIZE:
+        get_diarize_pipeline()
     yield
 
 
 app = FastAPI(lifespan=lifespan)
+
+
+def _save_upload(file: UploadFile, audio_bytes: bytes) -> str:
+    suffix = os.path.splitext(file.filename or ".wav")[1] or ".wav"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(audio_bytes)
+        return tmp.name
+
+
+def _normalize_language(language: str):
+    lang = language.strip() or None
+    if lang == "auto":
+        lang = None
+    return lang
 
 
 @app.post("/transcribe")
@@ -37,28 +91,97 @@ async def transcribe(
     file: UploadFile = File(...),
     language: str = Form(""),
 ):
-    # Empty string or "auto" → let Whisper detect language automatically.
-    # Useful for mixed Russian/English speech.
-    lang = language.strip() or None
-    if lang == "auto":
-        lang = None
-
+    """Fast path: transcription only. Compatible with the voice-input client contract."""
+    lang = _normalize_language(language)
     audio_bytes = await file.read()
-    suffix = os.path.splitext(file.filename or ".wav")[1] or ".wav"
-
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
-        tmp.write(audio_bytes)
-        tmp_path = tmp.name
-
+    tmp_path = _save_upload(file, audio_bytes)
     try:
-        result = _model.transcribe(tmp_path, language=lang, initial_prompt=INITIAL_PROMPT)
-        text = result["text"].strip()
+        audio = whisperx.load_audio(tmp_path)
+        result = _model.transcribe(audio, batch_size=BATCH_SIZE, language=lang)
+        text = " ".join(seg["text"].strip() for seg in result["segments"]).strip()
+    finally:
+        os.unlink(tmp_path)
+    return JSONResponse({"text": text})
+
+
+@app.post("/diarize")
+async def diarize(
+    file: UploadFile = File(...),
+    language: str = Form(""),
+    min_speakers: int = Form(0),
+    max_speakers: int = Form(0),
+    format: str = Form("json"),
+):
+    """Full WhisperX pipeline: ASR + word alignment + speaker diarization.
+
+    format=json  → {"language": "...", "segments": [{start, end, speaker, text}, ...]}
+    format=text  → {"language": "...", "text": "[SPEAKER_00] ...\\n\\n[SPEAKER_01] ..."}
+    """
+    lang = _normalize_language(language)
+    audio_bytes = await file.read()
+    tmp_path = _save_upload(file, audio_bytes)
+    try:
+        audio = whisperx.load_audio(tmp_path)
+        result = _model.transcribe(audio, batch_size=BATCH_SIZE, language=lang)
+        lang_code = result["language"]
+
+        align_model, metadata = get_align_model(lang_code)
+        result = whisperx.align(
+            result["segments"],
+            align_model,
+            metadata,
+            audio,
+            DEVICE,
+            return_char_alignments=False,
+        )
+
+        pipe = get_diarize_pipeline()
+        diarize_kwargs = {}
+        if min_speakers > 0:
+            diarize_kwargs["min_speakers"] = min_speakers
+        if max_speakers > 0:
+            diarize_kwargs["max_speakers"] = max_speakers
+        diarize_segments = pipe(audio, **diarize_kwargs)
+        result = whisperx.assign_word_speakers(diarize_segments, result)
     finally:
         os.unlink(tmp_path)
 
-    return JSONResponse({"text": text})
+    segments = [
+        {
+            "start": float(seg["start"]),
+            "end": float(seg["end"]),
+            "speaker": seg.get("speaker", "UNKNOWN"),
+            "text": seg["text"].strip(),
+        }
+        for seg in result["segments"]
+    ]
+
+    if format == "text":
+        lines = []
+        current_speaker = None
+        current_text = []
+        for s in segments:
+            if s["speaker"] != current_speaker:
+                if current_text:
+                    lines.append(f"[{current_speaker}] {' '.join(current_text)}")
+                current_speaker = s["speaker"]
+                current_text = [s["text"]]
+            else:
+                current_text.append(s["text"])
+        if current_text:
+            lines.append(f"[{current_speaker}] {' '.join(current_text)}")
+        return JSONResponse({"language": lang_code, "text": "\n\n".join(lines)})
+
+    return JSONResponse({"language": lang_code, "segments": segments})
 
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "model": MODEL_NAME, "device": DEVICE}
+    return {
+        "status": "ok",
+        "model": MODEL_NAME,
+        "device": DEVICE,
+        "compute_type": COMPUTE_TYPE,
+        "diarize_loaded": _diarize_pipeline is not None,
+        "align_languages_loaded": sorted(_align_models.keys()),
+    }

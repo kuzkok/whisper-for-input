@@ -2,23 +2,39 @@
 # Install: cp whisper-for-input.container ~/.config/containers/systemd/
 # Then: systemctl --user daemon-reload
 #       systemctl --user start whisper-for-input
+#
+# Prerequisite: run ./download-models.sh once to populate ./models/.
+# The HF token used by that script is NOT mounted into the runtime container.
 
 [Unit]
-Description=Whisper ASR service for voice input
+Description=WhisperX ASR + diarization service
 After=network.target
 
 [Container]
 Image=localhost/whisper-for-input:latest
 PublishPort=127.0.0.1:8000:8000
-Volume=%h/.local/share/whisper:/root/.cache/whisper:z
-Environment=WHISPER_MODEL=medium
+# Map host UID/GID 1:1 so the in-container `whisper` user (UID 1000) lines up
+# with the host owner of ./models and ./torch-cache.
+UserNS=keep-id
+Volume=%h/Data/whisper/whisper-for-input/models:/home/whisper/.cache/huggingface:z,ro
+# WhisperX downloads its VAD model (~17MB) and torchaudio English alignment
+# (~360MB) on first use into ~/.cache/torch. Persist that so it survives
+# container rebuilds.
+Volume=%h/Data/whisper/whisper-for-input/torch-cache:/home/whisper/.cache/torch:z
+Environment=WHISPER_MODEL=dropbox-dash/faster-whisper-large-v3-turbo
 Environment=WHISPER_DEVICE=cuda
+Environment=WHISPER_COMPUTE_TYPE=int8_float16
+Environment=WHISPER_BATCH_SIZE=16
+Environment=HF_HOME=/home/whisper/.cache/huggingface
+# Models are pre-downloaded by ./download-models.sh on the host. No network or
+# token needed at runtime — fail fast on cache misses instead of silently fetching.
+Environment=HF_HUB_OFFLINE=1
 AddDevice=nvidia.com/gpu=all
 SecurityLabelDisable=true
 
 [Service]
 Restart=always
-# First start downloads ~1.5 GB model — give it time
+# First start touches large model files — give it time
 TimeoutStartSec=300
 
 [Install]

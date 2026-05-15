@@ -1,0 +1,15 @@
+# Pinned at build time via:
+#   podman run --rm whisper-for-input:latest pip3 freeze \
+#     | grep -viE '^(pip|setuptools|wheel)==' \
+#     | sort > requirements.txt
+# Initial bootstrap: only top-level packages listed, pip resolves transitives.
+#
+# torch/torchaudio versions must match the Dockerfile's first pip step,
+# otherwise the second pip resolves transitive constraints by uninstalling
+# and replacing the GPU build.
+torch==2.8.0
+torchaudio==2.8.0
+whisperx
+fastapi
+uvicorn[standard]
+python-multipart

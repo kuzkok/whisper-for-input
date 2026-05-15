@@ -7,11 +7,17 @@ services:
       - "127.0.0.1:8000:8000"
     security_opt:
       - label:disable
+    userns_mode: "keep-id"
     volumes:
-      - ./models:/root/.cache/whisper:z
+      - ./models:/home/whisper/.cache/huggingface:z,ro
+      - ./torch-cache:/home/whisper/.cache/torch:z
     environment:
-      - WHISPER_MODEL=turbo
+      - WHISPER_MODEL=dropbox-dash/faster-whisper-large-v3-turbo
       - WHISPER_DEVICE=cuda
+      - WHISPER_COMPUTE_TYPE=int8_float16
+      - WHISPER_BATCH_SIZE=16
+      - HF_HOME=/home/whisper/.cache/huggingface
+      - HF_HUB_OFFLINE=1
     deploy:
       resources:
         reservations:
