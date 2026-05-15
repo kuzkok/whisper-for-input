@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Push-to-talk voice input for KDE Wayland. Two cooperating processes on the same host:
 
 - **`server.py`** — long-running WhisperX HTTP service inside a rootless Podman container with NVIDIA GPU passthrough. Exposes `POST /transcribe` (ASR only, hot path for voice-input), `POST /diarize` (ASR + word-align + speaker diarization), `GET /health`.
-- **`voice-input.py`** — user-space daemon that reads `/dev/input/event*` via `evdev`, records with `arecord` while the hotkey (default `KEY_SCROLLLOCK`) is held, POSTs the WAV to the server, pastes the result via `wl-copy` + `xdotool key shift+Insert`.
+- **`voice-input/voice-input.py`** — user-space daemon that reads `/dev/input/event*` via `evdev`, records with `arecord` while the hotkey (default `KEY_SCROLLLOCK`) is held, POSTs the WAV to the server, pastes the result via `wl-copy` + `xdotool key shift+Insert`. The matching systemd unit lives at `voice-input/voice-input.service`.
 
 The split exists because Whisper model load is multi-second; the resident server avoids paying it per utterance.
 
@@ -50,8 +50,8 @@ podman build -t whisper-for-input:latest .
 systemctl --user restart whisper-for-input
 
 # Run voice-input directly for debugging (bypasses systemd)
-python3 voice-input.py --key KEY_SCROLLLOCK --lang ru --url http://localhost:8000
-python3 voice-input.py --list-keys                    # list available evdev key names
+python3 voice-input/voice-input.py --key KEY_SCROLLLOCK --lang ru --url http://localhost:8000
+python3 voice-input/voice-input.py --list-keys        # list available evdev key names
 
 # Manually hit the server
 curl -F 'file=@sample.wav' -F 'language=ru' http://localhost:8000/transcribe
@@ -64,7 +64,7 @@ There is no test suite, linter, or build/format command in this repo — don't i
 ## Editing gotchas
 
 - **Bumping the image tag** in `docker-compose.yml` (`whisper-for-input:20260515.4`) is a manual versioning convention, not auto-generated. The Quadlet unit uses `:latest`; they don't have to match.
-- **`voice-input.py` is copied to `~/.local/bin/voice-input` by `install.sh`** — editing the repo file alone won't affect the running service. Re-run `install.sh` or copy manually, then `systemctl --user restart voice-input`.
+- **`voice-input/voice-input.py` is copied to `~/.local/bin/voice-input` by `install.sh`** — editing the repo file alone won't affect the running service. Re-run `install.sh` or copy manually, then `systemctl --user restart voice-input`.
 - **`type_text()` uses `wl-copy` + `xdotool key shift+Insert`**, not `ydotool type`. This is intentional for Cyrillic — `ydotool type` mangles non-ASCII on most layouts. Don't "simplify" it back.
 - **Container is rootless Podman with `SecurityLabelDisable=true` / `label:disable`**. SELinux relabel (`:z`) on the model volume is needed; don't drop it.
 - **`HF_HUB_OFFLINE=1` is a guardrail, not a constraint to work around.** If a model isn't loading, the fix is to add it to `download-models.sh`, not to enable network in the container.

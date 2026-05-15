@@ -14,14 +14,14 @@ echo "Installed: $QUADLET_DIR/whisper-for-input.container"
 # ── voice-input script → ~/.local/bin ────────────────────────────────────────
 BIN_DIR="$HOME/.local/bin"
 mkdir -p "$BIN_DIR"
-cp "$SCRIPT_DIR/voice-input.py" "$BIN_DIR/voice-input"
+cp "$SCRIPT_DIR/voice-input/voice-input.py" "$BIN_DIR/voice-input"
 chmod +x "$BIN_DIR/voice-input"
 echo "Installed: $BIN_DIR/voice-input"
 
 # ── voice-input service ───────────────────────────────────────────────────────
 SERVICE_DIR="$HOME/.config/systemd/user"
 mkdir -p "$SERVICE_DIR"
-cp "$SCRIPT_DIR/voice-input.service" "$SERVICE_DIR/"
+cp "$SCRIPT_DIR/voice-input/voice-input.service" "$SERVICE_DIR/"
 echo "Installed: $SERVICE_DIR/voice-input.service"
 
 # ── Reload daemon ─────────────────────────────────────────────────────────────
