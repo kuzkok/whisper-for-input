@@ -1,0 +1,20 @@
+# Systemd user service for push-to-talk voice input.
+# Install: see install.sh
+#
+# %h expands to $HOME in systemd user units.
+
+[Unit]
+Description=Push-to-talk voice input via Whisper
+After=graphical-session.target whisper-for-input.service
+Requires=whisper-for-input.service
+
+[Service]
+Type=simple
+# KDE Wayland typically uses wayland-0; override via: systemctl --user edit voice-input
+Environment=WAYLAND_DISPLAY=wayland-0
+ExecStart=/usr/bin/python3 %h/.local/bin/voice-input
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

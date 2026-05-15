@@ -1,0 +1,25 @@
+# Podman Quadlet container unit.
+# Install: cp whisper-for-input.container ~/.config/containers/systemd/
+# Then: systemctl --user daemon-reload
+#       systemctl --user start whisper-for-input
+
+[Unit]
+Description=Whisper ASR service for voice input
+After=network.target
+
+[Container]
+Image=localhost/whisper-for-input:latest
+PublishPort=127.0.0.1:8000:8000
+Volume=%h/.local/share/whisper:/root/.cache/whisper:z
+Environment=WHISPER_MODEL=medium
+Environment=WHISPER_DEVICE=cuda
+AddDevice=nvidia.com/gpu=all
+SecurityLabelDisable=true
+
+[Service]
+Restart=always
+# First start downloads ~1.5 GB model — give it time
+TimeoutStartSec=300
+
+[Install]
+WantedBy=default.target

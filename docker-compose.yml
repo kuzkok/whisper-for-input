@@ -1,0 +1,21 @@
+services:
+  whisper:
+    build: .
+    image: whisper-for-input:latest
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    security_opt:
+      - label:disable
+    volumes:
+      - ./models:/root/.cache/whisper:z
+    environment:
+      - WHISPER_MODEL=turbo
+      - WHISPER_DEVICE=cuda
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
