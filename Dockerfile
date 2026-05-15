@@ -1,14 +1,16 @@
-FROM nvidia/cuda:12.8.2-runtime-ubuntu24.04
+FROM python:3.12-slim
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     VIRTUAL_ENV=/opt/venv \
-    PATH="/opt/venv/bin:$PATH"
+    PATH="/opt/venv/bin:$PATH" \
+    LD_LIBRARY_PATH="/opt/venv/lib/python3.12/site-packages/nvidia/npp/lib"
 
-RUN apt-get update && apt-get install -y \
-        python3 \
-        python3-venv \
+# Only audio bits — Python is in the base image. CUDA runtime libs come from
+# nvidia-* pip packages installed alongside torch; libcuda.so.1 (driver) is
+# injected at runtime via AddDevice=nvidia.com/gpu=all in the Quadlet unit.
+RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         libsndfile1 \
     && rm -rf /var/lib/apt/lists/*
@@ -19,19 +21,19 @@ RUN apt-get update && apt-get install -y \
 RUN groupadd --gid 5000 whisper && \
     useradd --uid 5000 --gid 5000 --create-home --shell /bin/bash whisper && \
     python3 -m venv "$VIRTUAL_ENV" && \
-    mkdir -p /app && \
-    chown -R whisper:whisper "$VIRTUAL_ENV" /app
+    mkdir -p /app /home/whisper/.cache && \
+    chown -R whisper:whisper "$VIRTUAL_ENV" /app /home/whisper/.cache
 
 USER whisper
 WORKDIR /app
 
 RUN pip install --upgrade pip
 
-# Pinned torch from the cu128 index — these wheels dynamically link against
-# system CUDA libs (already in the base image) instead of bundling ~3 GB of
-# nvidia-* packages like the PyPI variant does.
+# torch from the cu128 index. Wheels declare nvidia-* CUDA runtime packages as
+# pip dependencies — they get installed into site-packages/nvidia/* and torch
+# adds them to its dlopen path at import time.
 # WhisperX → pyannote.audio 4.x → torchcodec 0.7 pins torch ABI to 2.8.*.
-RUN pip install torch==2.8.0 torchaudio==2.8.0 \
+RUN pip install torch==2.8.0+cu128 torchaudio==2.8.0+cu128 \
         --index-url https://download.pytorch.org/whl/cu128
 
 # Everything else (whisperx, faster-whisper, pyannote.audio, ctranslate2,

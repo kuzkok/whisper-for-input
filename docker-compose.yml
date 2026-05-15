@@ -1,16 +1,16 @@
 services:
   whisper:
     build: .
-    image: whisper-for-input:latest
+    image: whisper-for-input:20260515.4
     restart: unless-stopped
     ports:
       - "127.0.0.1:8000:8000"
     security_opt:
       - label:disable
-    userns_mode: "keep-id"
+    userns_mode: "keep-id:uid=5000,gid=5000"
     volumes:
-      - ./models:/home/whisper/.cache/huggingface:z,ro
-      - ./torch-cache:/home/whisper/.cache/torch:z
+      - ${HOME}/.local/share/whisper-for-input/models:/home/whisper/.cache/huggingface:z,ro
+      - ${HOME}/.local/share/whisper-for-input/torch-cache:/home/whisper/.cache/torch:z
     environment:
       - WHISPER_MODEL=dropbox-dash/faster-whisper-large-v3-turbo
       - WHISPER_DEVICE=cuda
@@ -18,6 +18,7 @@ services:
       - WHISPER_BATCH_SIZE=16
       - HF_HOME=/home/whisper/.cache/huggingface
       - HF_HUB_OFFLINE=1
+      - LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/nvidia/npp/lib
     deploy:
       resources:
         reservations:

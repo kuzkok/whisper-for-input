@@ -8,7 +8,12 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-MODELS_DIR="$SCRIPT_DIR/models"
+# Models and torch-cache live outside the project tree so it can be moved
+# without breaking the service. Matches the Volume= paths in the Quadlet unit
+# and docker-compose.yml.
+DATA_DIR="$HOME/.local/share/whisper-for-input"
+MODELS_DIR="$DATA_DIR/models"
+TORCH_CACHE_DIR="$DATA_DIR/torch-cache"
 TOKEN_FILE="$SCRIPT_DIR/secrets/hf_token"
 
 if [[ ! -f "$TOKEN_FILE" ]]; then
@@ -40,7 +45,7 @@ mkdir -p "$MODELS_DIR"
 # Pre-create torch cache dir so the container can bind-mount it on first start.
 # Contents (WhisperX VAD, torchaudio alignment) are populated by the container
 # on first request, not by this script.
-mkdir -p "$SCRIPT_DIR/torch-cache"
+mkdir -p "$TORCH_CACHE_DIR"
 
 if command -v hf >/dev/null; then
     HF_CLI=(hf download)
@@ -78,4 +83,4 @@ download "jonatasgrosman/wav2vec2-large-xlsr-53-russian"
 echo
 echo "Done. Models live in $MODELS_DIR."
 du -sh "$MODELS_DIR" 2>/dev/null || true
-echo "Container mounts this dir at /root/.cache/huggingface (read-only)."
+echo "Container mounts this dir at /home/whisper/.cache/huggingface (read-only)."

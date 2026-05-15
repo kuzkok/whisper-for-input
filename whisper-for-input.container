@@ -13,14 +13,15 @@ After=network.target
 [Container]
 Image=localhost/whisper-for-input:latest
 PublishPort=127.0.0.1:8000:8000
-# Map host UID/GID 1:1 so the in-container `whisper` user (UID 1000) lines up
-# with the host owner of ./models and ./torch-cache.
-UserNS=keep-id
-Volume=%h/Data/whisper/whisper-for-input/models:/home/whisper/.cache/huggingface:z,ro
+# Map the calling host user (kuzkok) to the in-container `whisper` user
+# (UID/GID 5000). The mounted models/ and torch-cache/ dirs (owned by host
+# kuzkok) then appear to `whisper` as its own files — no chown required.
+UserNS=keep-id:uid=5000,gid=5000
+Volume=%h/.local/share/whisper-for-input/models:/home/whisper/.cache/huggingface:z,ro
 # WhisperX downloads its VAD model (~17MB) and torchaudio English alignment
 # (~360MB) on first use into ~/.cache/torch. Persist that so it survives
 # container rebuilds.
-Volume=%h/Data/whisper/whisper-for-input/torch-cache:/home/whisper/.cache/torch:z
+Volume=%h/.local/share/whisper-for-input/torch-cache:/home/whisper/.cache/torch:z
 Environment=WHISPER_MODEL=dropbox-dash/faster-whisper-large-v3-turbo
 Environment=WHISPER_DEVICE=cuda
 Environment=WHISPER_COMPUTE_TYPE=int8_float16

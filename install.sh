@@ -29,14 +29,18 @@ systemctl --user daemon-reload
 echo "Daemon reloaded."
 
 # ── Prerequisite checks (warn, don't block) ──────────────────────────────────
-if [[ ! -d "$SCRIPT_DIR/models" || -z "$(ls -A "$SCRIPT_DIR/models" 2>/dev/null)" ]]; then
-    echo "WARN: ./models/ is empty. Run ./download-models.sh before starting the service."
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/whisper-for-input"
+MODELS_DIR="$DATA_DIR/models"
+TORCH_CACHE_DIR="$DATA_DIR/torch-cache"
+
+if [[ ! -d "$MODELS_DIR" || -z "$(ls -A "$MODELS_DIR" 2>/dev/null)" ]]; then
+    echo "WARN: $MODELS_DIR is empty. Run ./download-models.sh before starting the service."
     echo "      (download-models.sh needs ./secrets/hf_token, but the runtime container does not.)"
 fi
 
-mkdir -p "$SCRIPT_DIR/torch-cache"
-if [[ -z "$(ls -A "$SCRIPT_DIR/torch-cache" 2>/dev/null)" ]]; then
-    echo "NOTE: ./torch-cache/ is empty. First /transcribe will download the WhisperX VAD"
+mkdir -p "$TORCH_CACHE_DIR"
+if [[ -z "$(ls -A "$TORCH_CACHE_DIR" 2>/dev/null)" ]]; then
+    echo "NOTE: $TORCH_CACHE_DIR is empty. First /transcribe will download the WhisperX VAD"
     echo "      model (~17MB) and the first English /diarize will fetch torchaudio's"
     echo "      alignment weights (~360MB). Cached afterwards."
 fi
@@ -56,7 +60,7 @@ cat <<'EOF'
 Done. Next steps:
 
   # First-time setup (once):
-  ./download-models.sh                  # populates ./models/ (~3-4 GB)
+  ./download-models.sh                  # populates ~/.local/share/whisper-for-input/models/ (~6-7 GB)
 
   # Start (and enable on login):
   systemctl --user enable --now whisper-for-input
