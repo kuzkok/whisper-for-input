@@ -1,0 +1,6 @@
+tests/fixtures/*.wav filter=lfs diff=lfs merge=lfs -text
+tests/fixtures/*.mp3 filter=lfs diff=lfs merge=lfs -text
+tests/fixtures/*.ogg filter=lfs diff=lfs merge=lfs -text
+tests/fixtures/*.ogx filter=lfs diff=lfs merge=lfs -text
+tests/fixtures/*.flac filter=lfs diff=lfs merge=lfs -text
+tests/fixtures/*.m4a filter=lfs diff=lfs merge=lfs -text

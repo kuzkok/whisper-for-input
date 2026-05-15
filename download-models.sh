@@ -4,6 +4,7 @@
 #
 # Required HF licenses (accept these on huggingface.co before running):
 #   https://huggingface.co/pyannote/speaker-diarization-3.1
+#   https://huggingface.co/pyannote/speaker-diarization-community-1
 #   https://huggingface.co/pyannote/segmentation-3.0
 set -euo pipefail
 
@@ -60,7 +61,14 @@ fi
 
 download() {
     local repo="$1"
+    # HF кэширует репо в $HF_HOME/hub/models--<org>--<repo>/. Если каталог
+    # есть и непустой — пропускаем, чтобы не дёргать сеть HEAD-запросами.
+    local cache_dir="$HF_HOME/hub/models--${repo//\//--}"
     echo
+    if [[ -d "$cache_dir" && -n "$(ls -A "$cache_dir" 2>/dev/null)" ]]; then
+        echo "==> $repo (уже в кэше, пропускаем)"
+        return
+    fi
     echo "==> $repo"
     "${HF_CLI[@]}" "$repo" --token "$HF_TOKEN"
 }
@@ -73,6 +81,10 @@ download "dropbox-dash/faster-whisper-large-v3-turbo"
 
 # Diarization pipeline + its component models.
 download "pyannote/speaker-diarization-3.1"
+# pyannote.audio 4.x делает 3.1-пайплайн зависимым от community-1: при загрузке
+# 3.1 он лезет в community-1 за xvec_transform.npz (PLDA), и под HF_HUB_OFFLINE=1
+# падает на cache miss. Поэтому community-1 тоже предзагружаем.
+download "pyannote/speaker-diarization-community-1"
 download "pyannote/segmentation-3.0"
 download "pyannote/wespeaker-voxceleb-resnet34-LM"
 

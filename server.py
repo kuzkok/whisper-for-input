@@ -6,6 +6,7 @@ Endpoints:
   POST /diarize     — full WhisperX pipeline: transcribe + word-align + speaker diarize.
   GET  /health
 """
+import dataclasses
 import os
 import tempfile
 from contextlib import asynccontextmanager
@@ -13,6 +14,10 @@ from contextlib import asynccontextmanager
 import whisperx
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse
+# Явный импорт сверху — fail-fast на API-дрифте whisperx (атрибут переехал
+# из whisperx в whisperx.diarize в 3.8.x). Smoke-тест ловит это на старте,
+# а не лениво на первом /diarize.
+from whisperx.diarize import DiarizationPipeline
 
 MODEL_NAME = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
 DEVICE = os.environ.get("WHISPER_DEVICE", "cuda")
@@ -44,7 +49,14 @@ def get_diarize_pipeline():
     global _diarize_pipeline
     if _diarize_pipeline is None:
         print("Loading pyannote diarization pipeline...", flush=True)
-        _diarize_pipeline = whisperx.DiarizationPipeline(use_auth_token=None, device=DEVICE)
+        # model_name указан явно: дефолт пайплайна — pyannote/speaker-diarization-community-1,
+        # которую download-models.sh НЕ предзагружает. Под HF_HUB_OFFLINE=1 это уронит
+        # контейнер на cache miss. Менять эту строку → обязательно обновлять download-models.sh.
+        _diarize_pipeline = DiarizationPipeline(
+            model_name="pyannote/speaker-diarization-3.1",
+            token=None,
+            device=DEVICE,
+        )
         print("Diarization pipeline ready.", flush=True)
     return _diarize_pipeline
 
@@ -86,17 +98,36 @@ def _normalize_language(language: str):
     return lang
 
 
+def _set_initial_prompt(prompt):
+    """Per-request мутация _model.options.initial_prompt.
+
+    whisperx 3.8.5 не позволяет передать initial_prompt в model.transcribe(...) —
+    он зашит в asr_options на этапе load_model. Чтобы /transcribe и /diarize
+    использовали разные промпты (диктовка vs произвольная встреча), мутируем
+    options перед каждым вызовом. faster_whisper.TranscriptionOptions — это
+    dataclass; whisperx сам пользуется dataclasses.replace по тому же паттерну
+    (см. .venv/.../whisperx/asr.py:262).
+    """
+    _model.options = dataclasses.replace(_model.options, initial_prompt=prompt)
+
+
 @app.post("/transcribe")
 async def transcribe(
     file: UploadFile = File(...),
     language: str = Form(""),
 ):
-    """Fast path: transcription only. Compatible with the voice-input client contract."""
+    """Fast path: transcription only. Compatible with the voice-input client contract.
+
+    Использует INITIAL_PROMPT — этот эндпоинт обслуживает voice-input
+    (push-to-talk диктовку разработчика), и подсказка про команды/латиницу
+    повышает качество русской транскрипции технических терминов.
+    """
     lang = _normalize_language(language)
     audio_bytes = await file.read()
     tmp_path = _save_upload(file, audio_bytes)
     try:
         audio = whisperx.load_audio(tmp_path)
+        _set_initial_prompt(INITIAL_PROMPT or None)
         result = _model.transcribe(audio, batch_size=BATCH_SIZE, language=lang)
         text = " ".join(seg["text"].strip() for seg in result["segments"]).strip()
     finally:
@@ -116,12 +147,17 @@ async def diarize(
 
     format=json  → {"language": "...", "segments": [{start, end, speaker, text}, ...]}
     format=text  → {"language": "...", "text": "[SPEAKER_00] ...\\n\\n[SPEAKER_01] ..."}
+
+    INITIAL_PROMPT здесь НЕ используется: эндпоинт обслуживает произвольные
+    встречи/видео, и русская подсказка про разработчика загнала бы английскую
+    речь в перевод (Whisper интерпретирует prompt как контекст языка).
     """
     lang = _normalize_language(language)
     audio_bytes = await file.read()
     tmp_path = _save_upload(file, audio_bytes)
     try:
         audio = whisperx.load_audio(tmp_path)
+        _set_initial_prompt(None)
         result = _model.transcribe(audio, batch_size=BATCH_SIZE, language=lang)
         lang_code = result["language"]
 

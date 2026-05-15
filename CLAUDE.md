@@ -16,7 +16,7 @@ The split exists because Whisper model load is multi-second; the resident server
 **Models live outside the repo on the host** at `~/.local/share/whisper-for-input/models/` (HF cache, read-only mount) and `.../torch-cache/` (writable). The container runs with `HF_HUB_OFFLINE=1`, so anything not pre-fetched by `download-models.sh` will fail at runtime, not silently download. Three places reference these paths and **must stay in sync**: `whisper-for-input.container` (`Volume=`), `docker-compose.yml` (`volumes:`), `download-models.sh` (`DATA_DIR`).
 
 **Two model fetch paths, intentionally:**
-- `download-models.sh` (host, needs `./secrets/hf_token`) pulls the faster-whisper CTranslate2 weights, pyannote diarization + segmentation + wespeaker, and the Russian wav2vec2 alignment model into the HF cache.
+- `download-models.sh` (host, needs `./secrets/hf_token`) pulls the faster-whisper CTranslate2 weights, pyannote diarization (3.1 + community-1) + segmentation + wespeaker, and the Russian wav2vec2 alignment model into the HF cache. The community-1 repo is needed even though `server.py` selects 3.1 — pyannote.audio 4.x's 3.1 pipeline lazily loads `xvec_transform.npz` from community-1 as its PLDA component, and under `HF_HUB_OFFLINE=1` that fails on cache miss.
 - WhisperX's VAD (~17MB) and torchaudio's English alignment weights (~360MB) are **not** in the HF cache — they download to `~/.cache/torch` on first request. That's why `torch-cache` is a separate writable volume.
 
 **UID mapping:** Container runs as `whisper` (UID 5000). Quadlet unit uses `UserNS=keep-id:uid=5000,gid=5000` so host-owned model files appear to the container user without chown. `docker-compose.yml` mirrors this with `userns_mode: "keep-id:uid=5000,gid=5000"`.
@@ -26,6 +26,8 @@ The split exists because Whisper model load is multi-second; the resident server
 **Alignment model cache is per-language and lazy.** `server.py:_align_models` keys by language code; the Russian wav2vec2 is pre-downloaded, English is fetched on first English `/diarize`. Languages without pre-cached weights will fail in offline mode.
 
 **`PRELOAD_DIARIZE=1`** loads the pyannote pipeline at startup (adds ~5s + GPU memory). Off by default — diarization is the cold path. The transcribe model always loads at startup via the `lifespan` context manager.
+
+**`INITIAL_PROMPT` is per-endpoint, not per-model.** `whisperx.load_model()` bakes `initial_prompt` into `asr_options` once, so it would otherwise apply to both endpoints. `_set_initial_prompt()` mutates `_model.options` (a faster_whisper `TranscriptionOptions` dataclass) via `dataclasses.replace` before each call: `/transcribe` uses `INITIAL_PROMPT` (voice-input dictation context — improves Russian punctuation and keeps English tech terms in Latin script), `/diarize` uses `None` (arbitrary meeting/video content — the Russian prompt would bias Whisper to translate English speech to Russian even with `language="en"`).
 
 ## Common commands
 
@@ -59,7 +61,37 @@ curl -F 'file=@sample.wav' -F 'language=' -F 'format=text' http://localhost:8000
 curl http://localhost:8000/health
 ```
 
-There is no test suite, linter, or build/format command in this repo — don't invent one.
+## Локальная дев-среда и тесты
+
+Чтобы итерироваться над `server.py` без пересборки контейнерного образа, есть локальный venv с тем же стеком, что внутри контейнера (Python 3.12 + cu128 wheels).
+
+```bash
+# Один раз: поднять venv с зависимостями (~5 мин, ~5 GB)
+python3.12 -m venv .venv
+.venv/bin/pip install -r requirements.txt -r requirements-dev.txt \
+    --extra-index-url https://download.pytorch.org/whl/cu128
+
+# Если только что склонировал репо — подтянуть LFS-фикстуры:
+git lfs pull
+
+# Дев-цикл
+.venv/bin/pytest -m smoke           # ~доли секунды, ловит API-дрифт whisperx
+.venv/bin/pytest -m unit            # ~секунды, логика обработчиков с моками
+.venv/bin/pytest                    # smoke + unit (gpu выключены addopts'ом)
+# GPU integration — нужны те же env vars, что у systemd unit/контейнера:
+LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/nvidia/npp/lib" \
+    HF_HOME="$HOME/.local/share/whisper-for-input/models" \
+    HF_HUB_OFFLINE=1 \
+    WHISPER_MODEL=dropbox-dash/faster-whisper-large-v3-turbo \
+    .venv/bin/pytest -m gpu          # реальные модели + GPU, ~минута на холодную
+.venv/bin/uvicorn server:app --reload  # ручная проверка с reload
+
+# Только когда `pytest -m gpu` зелёный — пересобирать образ
+podman build -t whisper-for-input:latest .
+systemctl --user restart whisper-for-input
+```
+
+Audio-фикстуры (`tests/fixtures/{ru_short,jfk}.wav`) хранятся через git-lfs. Sidecar JSON рядом с каждым WAV содержит транскрипт, source URL и лицензию. Менять фикстуры — обычным `git add` после ручной замены файла.
 
 ## Editing gotchas
 

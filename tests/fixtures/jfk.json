@@ -1,0 +1,9 @@
+{
+  "transcript": "And so my fellow Americans, ask not what your country can do for you, ask what you can do for your country.",
+  "language": "en",
+  "source_url": "https://github.com/ggerganov/whisper.cpp/raw/master/samples/jfk.wav",
+  "license": "public-domain",
+  "duration_s": 11.0,
+  "sample_rate": 16000,
+  "channels": 1
+}
