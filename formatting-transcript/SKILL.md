@@ -32,7 +32,7 @@ Per-chunk processing happens in a Haiku subagent so the main session's context s
 
 - Add `.` and `,`
 - Capitalize sentence starts and proper nouns
-- Insert blank lines between paragraphs
+- Insert paragraph breaks (single newline between paragraphs — **no blank line**)
 
 ## What is forbidden
 
@@ -45,6 +45,24 @@ Per-chunk processing happens in a Haiku subagent so the main session's context s
 - Translating or transliterating tech terms (`React`, `Docker`, `npm install` stay verbatim in any language)
 - Inserting headings (`#`, `##`, `###`) unless the user explicitly asks
 - Processing chunks inline in the main agent — always dispatch to a Haiku subagent (see step 4)
+- Inspecting source / normalized / output files between chunk dispatches with `Read`, `Grep`, or Bash (`sed`, `cat`, `head`, `tail`, `awk`, `wc`, `diff`, etc.) — see "Main agent discipline" below
+
+## Main agent discipline — no detours between chunks
+
+The chunk loop must be deterministic, like a `for` loop in a script. Between dispatches the main agent does **exactly two operations**, in this order:
+
+1. Extract `trailing_buffer` from the previous subagent's response via the marker regex (`===BUFFER===\n(.*?)\n===END===`, DOTALL).
+2. Dispatch the next chunk's subagent with the new offset, `is_final`, and that buffer.
+
+Everything else is forbidden until **all N chunks have returned**:
+
+- No `Read` on the source, normalized, or output file.
+- No Bash commands of any kind — no `sed`, `cat`, `head`, `tail`, `awk`, `grep`, `wc`, `diff`, `ls`, no peeking at chunk boundaries, no spot-checking the output.
+- No "let me just verify the buffer looks right" — trust the marker regex; if it matches, dispatch.
+- No status narration that requires inspecting content («N слов записано», «чанк завершился на полном предложении») — the main agent has no way to know these without forbidden inspection. A short progress line like "chunk i/N dispatched" is fine.
+- No clarifying questions to the user mid-loop unless a subagent returns a hard failure (missing markers, error).
+
+All verification — `wc -w`, content sanity checks, anything that reads the files — happens **only in step 6**, after the final chunk's subagent has returned. If you feel the urge to look at a file mid-loop, that is the drift this rule exists to prevent. Resist it; the loop is supposed to be boring.
 
 ## Workflow
 
@@ -79,6 +97,8 @@ wc -l "<source-stem>.normalized.txt"
 | …     | …      | 40    | false    |
 | N     | 1+40*(N-1) | 40 | **true** |
 
+Create a `TodoWrite` list with exactly N items, one per chunk (`Chunk 1/N`, `Chunk 2/N`, …, `Chunk N/N`). Mark each one completed the moment the buffer has been extracted and the next dispatch is queued. The todo list is the loop counter — it locks the main agent into the for-loop shape and makes any detour visually obvious.
+
 ### 4. For each chunk: dispatch a Haiku subagent
 
 **Sequentially** (NOT in parallel — each subagent needs the trailing buffer from the previous one), dispatch a subagent using the `Agent` tool with `subagent_type: "general-purpose"` and `model: "haiku"`.
@@ -101,7 +121,7 @@ You are formatting one chunk of a raw transcript. Follow the rules below exactly
 
 RULES (Iron Law: preserve every word of the source in the same order):
 - Add ONLY `.` and `,`. No other punctuation marks: no `?`, `!`, `:`, `;`, `—`, `«»`, `""`, `''`, `()`, `[]`.
-- Insert blank lines between paragraphs (~3–7 sentences per paragraph; more is OK if the speaker stays on one topic).
+- Separate paragraphs with a SINGLE newline (`\n`), NOT a blank line (`\n\n`). One paragraph per line. ~3–7 sentences per paragraph; more is OK if the speaker stays on one topic.
 - Capitalize sentence starts and proper nouns.
 - Preserve EVERY source word in original order. Filler words, colloquialisms, repeated words, typos — all stay.
 - Preserve `[музыка]` / `[music]` markers verbatim.
@@ -126,11 +146,10 @@ STEPS:
 6. Append the finished paragraphs to output_path with a Bash heredoc (use `tee -a`, NOT `cat >>` — `>>` triggers Claude Code's write-redirection check and prompts per chunk):
    ```
    tee -a "<output_path>" <<'OUT_EOF'
-   
-   <finished paragraphs separated by blank lines>
+   <finished paragraphs, ONE paragraph per line, no blank lines between them>
    OUT_EOF
    ```
-   The leading blank line preserves paragraph separation between chunks. `tee -a` will echo the content to stdout — that's harmless, it just appears in the tool result.
+   No leading blank line. Each paragraph is one line; paragraphs are separated by a single `\n`. The heredoc's trailing newline cleanly separates this chunk's last paragraph from the next chunk's first paragraph (still single-newline). `tee -a` echoes content to stdout — harmless, just appears in the tool result.
 7. End your response with EXACTLY these three lines (and nothing else after):
    ```
    ===BUFFER===
@@ -164,13 +183,13 @@ If verification fails, **keep** the normalized file — it helps debug which chu
 
 ## Paragraph break heuristics
 
-Subagents should insert a blank line when:
+Subagents should start a new paragraph (single `\n`, **not** a blank line) when:
 
 - Speaker shifts topic or subtopic
 - After a clear conclusion or summary marker («итак», «поэтому», «короче», "so", "in summary", "to wrap up")
 - A paragraph exceeds ~7 sentences and the speaker pauses on a sub-point
 
-Do **not** insert a heading instead of a blank line. Paragraphs only.
+Do **not** insert a heading or a blank line between paragraphs. One paragraph per line, separated only by `\n`.
 
 ## Common mistakes
 
@@ -180,6 +199,7 @@ Do **not** insert a heading instead of a blank line. Paragraphs only.
 | Subagent deleted filler («э-э», «ну», "um") | Re-dispatch the chunk; filler is part of the speaker's text. |
 | Main agent ran chunks in parallel | Sequential only — each chunk needs the previous chunk's buffer. |
 | Main agent read the chunk itself via Read | Re-do: dispatch the subagent with offset/limit/output_path so the chunk text lives in subagent context, not main. |
+| Main agent ran `sed`/`cat`/`head`/`wc`/`Read` between chunk dispatches to "verify" something | Forbidden by "Main agent discipline". Trust the marker regex; verification happens only in step 6. |
 | Skipped `fold` because "file looks fine" | Run it anyway. It is idempotent — already-wrapped files pass through. |
 | Lost the last words of a chunk | Subagent must save trailing buffer at non-final chunks. |
 | Subagent response missed the `===BUFFER===` markers | Re-dispatch with output-format reminder emphasized. |
