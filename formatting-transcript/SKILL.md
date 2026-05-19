@@ -117,7 +117,7 @@ This bounds the main agent's context to dispatch params + the short buffer strin
 Substitute the bracketed values per chunk:
 
 ```
-You are formatting one chunk of a raw transcript. Follow the rules below exactly.
+You are formatting one chunk of a raw transcript. Follow the rules and tool whitelist below exactly. Do not improvise.
 
 RULES (Iron Law: preserve every word of the source in the same order):
 - Add ONLY `.` and `,`. No other punctuation marks: no `?`, `!`, `:`, `;`, `—`, `«»`, `""`, `''`, `()`, `[]`.
@@ -129,6 +129,20 @@ RULES (Iron Law: preserve every word of the source in the same order):
 - Tech terms stay verbatim (`React`, `Docker`, `Kubernetes`, `npm install`).
 - No headings (`#`, `##`, `###`).
 
+ALLOWED TOOLS (exhaustive whitelist — you may use ONLY these two tool calls, in this order, and nothing else):
+1. ONE `Read(normalized_path, offset, limit)` call to load your chunk.
+2. ONE `Bash` call: a single `tee -a "<output_path>" <<'OUT_EOF' ... OUT_EOF` heredoc to append the finished paragraphs.
+
+Total tool calls per run: exactly 2. No exceptions. After that, end your response with the buffer marker block (text only, not a tool call).
+
+FORBIDDEN ACTIONS (any one of these is a hard failure — abort and return an error instead of doing them):
+- Do NOT write or execute scripts of any kind. No `python`, no `python3`, no `node`, no `perl`, no `ruby`, no inline `-c '...'`.
+- Do NOT use text-processing utilities: no `sed`, `awk`, `grep`, `cut`, `tr`, `sort`, `uniq`, `head`, `tail`, `cat`, `wc`, `diff`, `fold`, `xargs`.
+- Do NOT create scratch / helper / temporary files. No `cat > /tmp/...`, no `Write`, no `Edit`, no `mkdir`, no `touch`. The only file you write to is `output_path`, via the single `tee -a` heredoc.
+- Do NOT make multiple `Read` calls. One chunk = one Read. Do not re-read to "double-check".
+- Do NOT make multiple `Bash` calls. One chunk = one `tee -a` call. Do not split paragraphs across calls.
+- Do NOT shell out to "find the cutoff point" or "count words" or "verify the buffer". Steps 2–5 below are mental operations on the chunk text inside your own response; they do not use tools.
+
 INPUT:
 - normalized_path: <ABSOLUTE_PATH_TO_NORMALIZED_FILE>
 - offset: <OFFSET>
@@ -137,25 +151,35 @@ INPUT:
 - is_final: <true|false>
 - output_path: <ABSOLUTE_PATH_TO_OUTPUT_FILE>
 
-STEPS:
-1. Read the chunk: `Read(normalized_path, offset, limit)`. Strip the `cat -n` line-number prefix that Read adds (everything before the tab on each line). Join the lines with single spaces.
-2. Prepend the trailing_buffer (with a space separator if both are non-empty) to form the chunk text.
-3. Add `.` and `,` per the rules. Group into paragraphs.
-4. If is_final is false: cut at the last complete sentence. Everything after that is the NEW trailing_buffer. If the text ends on a conjunction (`и`, `или`, `но`, `а`, `что`, `чтобы`, `that`, `because`, `so`), a preposition (`в`, `на`, `с`, `к`, `in`, `on`, `with`, `for`), an article (`the`, `a`, `an`), or any grammatically incomplete fragment, save more to the buffer. When in doubt, save more.
-5. If is_final is true: terminate the last sentence with a period if it lacks one. The whole text is finished; the new trailing_buffer is empty.
-6. Append the finished paragraphs to output_path with a Bash heredoc (use `tee -a`, NOT `cat >>` — `>>` triggers Claude Code's write-redirection check and prompts per chunk):
+STEPS (steps 2–5 are done in your head — NO tool calls between Read and tee):
+1. [TOOL: Read] `Read(normalized_path, offset, limit)`. Strip the `cat -n` line-number prefix that Read adds (everything before the tab on each line). Join the lines with single spaces. This is your only Read.
+2. [MENTAL] Prepend the trailing_buffer (with a space separator if both are non-empty) to form the chunk text.
+3. [MENTAL] Add `.` and `,` per the rules. Group into paragraphs.
+4. [MENTAL] If is_final is false: pick the cut point yourself by reading the text — find the last sentence that ends on a clear terminal word and a complete thought. Everything after that point is the NEW trailing_buffer. If the text ends on a conjunction (`и`, `или`, `но`, `а`, `что`, `чтобы`, `that`, `because`, `so`), a preposition (`в`, `на`, `с`, `к`, `in`, `on`, `with`, `for`), an article (`the`, `a`, `an`), or any grammatically incomplete fragment, save more to the buffer. When in doubt, save more. **This is a linguistic judgment you make directly — do not write a script, regex, or `rfind` lookup to find the cut.**
+5. [MENTAL] If is_final is true: terminate the last sentence with a period if it lacks one. The whole text is finished; the new trailing_buffer is empty.
+6. [TOOL: Bash] Append the finished paragraphs to output_path with ONE Bash heredoc (use `tee -a`, NOT `cat >>` — `>>` triggers Claude Code's write-redirection check and prompts per chunk):
    ```
    tee -a "<output_path>" <<'OUT_EOF'
    <finished paragraphs, ONE paragraph per line, no blank lines between them>
    OUT_EOF
    ```
-   No leading blank line. Each paragraph is one line; paragraphs are separated by a single `\n`. The heredoc's trailing newline cleanly separates this chunk's last paragraph from the next chunk's first paragraph (still single-newline). `tee -a` echoes content to stdout — harmless, just appears in the tool result.
+   No leading blank line. Each paragraph is one line; paragraphs are separated by a single `\n`. The heredoc's trailing newline cleanly separates this chunk's last paragraph from the next chunk's first paragraph (still single-newline). `tee -a` echoes content to stdout — harmless, just appears in the tool result. This is your only Bash call.
 7. End your response with EXACTLY these three lines (and nothing else after):
    ```
    ===BUFFER===
    <trailing buffer string, or blank line if final>
    ===END===
    ```
+
+SUBAGENT RED FLAGS — if any of these thoughts arise, STOP and just do the mental work in your response:
+- "Let me write a quick Python script to find the cutoff phrase" → No. Pick the cut by reading the text.
+- "I'll `cat > /tmp/format.py` to handle this cleanly" → No. No scratch files. Ever.
+- "Let me run `sed` / `awk` to clean this up" → No. Punctuation is added in your head, written via `tee -a`.
+- "I'll do a `Read` again to double-check the chunk" → No. One Read per chunk.
+- "Let me `wc -w` to verify the buffer is right size" → No. Trust your judgment; main agent verifies at the end.
+- "I'll split this into two `tee -a` calls so each paragraph is separate" → No. One heredoc with all paragraphs.
+
+If you find yourself reaching for any forbidden tool: that is the violation this prompt exists to prevent. The Iron Law of this skill is that processing happens in your head; tools only ferry text in (Read) and out (tee -a).
 ```
 
 ### 5. Collect the buffer between chunks
@@ -197,6 +221,9 @@ Do **not** insert a heading or a blank line between paragraphs. One paragraph pe
 |---------|-----|
 | Subagent added `«»`, `—`, `:`, `?`, `!`, etc. | Re-dispatch the chunk with a stronger reminder: ONLY `.` and `,` are allowed. |
 | Subagent deleted filler («э-э», «ну», "um") | Re-dispatch the chunk; filler is part of the speaker's text. |
+| Subagent wrote a helper script (`cat > /tmp/*.py`, `python -c`, `sed`, `awk`, etc.) to "find the cutoff" or "process the text" | Hard violation of the subagent tool whitelist. Re-dispatch with the ALLOWED TOOLS / FORBIDDEN ACTIONS blocks emphasized. Steps 2–5 are mental — no shell, no Python. |
+| Subagent made >1 Read or >1 Bash call per chunk | Re-dispatch. Exactly one Read (load chunk) and one Bash (`tee -a` heredoc). Anything else is drift. |
+| Subagent used `Write` / `Edit` / created temp files | Re-dispatch. The only file write is the single `tee -a` to `output_path`. |
 | Main agent ran chunks in parallel | Sequential only — each chunk needs the previous chunk's buffer. |
 | Main agent read the chunk itself via Read | Re-do: dispatch the subagent with offset/limit/output_path so the chunk text lives in subagent context, not main. |
 | Main agent ran `sed`/`cat`/`head`/`wc`/`Read` between chunk dispatches to "verify" something | Forbidden by "Main agent discipline". Trust the marker regex; verification happens only in step 6. |
