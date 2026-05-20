@@ -53,29 +53,36 @@ If `missing`, ask the user once: "Add `Bash(tee:*)` to this project's `.claude/s
 - Translating or transliterating tech terms (`React`, `Docker`, `npm install` stay verbatim in any language)
 - Inserting headings (`#`, `##`, `###`) unless the user explicitly asks
 - Processing chunks inline in the main agent — always dispatch to a Haiku subagent (see step 4)
-- Inspecting source / normalized / output files between chunk dispatches with `Read`, `Grep`, or Bash (`sed`, `cat`, `head`, `tail`, `awk`, `wc`, `diff`, etc.) — see "Main agent discipline" below
+- Inspecting source / normalized / output files between chunk dispatches with `Read`, `Grep`, or Bash (`sed`, `cat`, `head`, `tail`, `awk`, `diff`, etc.). The ONE exception is `wc -w "<output_path>"` for the per-chunk growth check — see "Main agent discipline" below
 
 ## Main agent discipline — no detours between chunks
 
-The chunk loop must be deterministic, like a `for` loop in a script.
+The chunk loop must be deterministic, like a `for` loop in a script — but with two cheap structural signals per chunk that catch silent failures (echo, no growth) before they accumulate.
 
-**Hard precondition before step 4 (first chunk dispatch): a `TodoWrite` call with exactly N items (`Chunk 1/N` … `Chunk N/N`) has already been made.** No `Agent` dispatch happens before that. The todo list is the loop counter — without it visible in the harness UI, drift becomes invisible to both you and the user. If you find yourself about to dispatch chunk 1 and the todo list doesn't exist yet, STOP, call `TodoWrite` with all N items at once, then resume.
+**Hard preconditions before step 4 (first chunk dispatch):**
 
-Between dispatches the main agent does **exactly three operations**, in this order:
+1. A `TodoWrite` call with exactly N items (`Chunk 1/N` … `Chunk N/N`) has been made.
+2. The output file has been `touch`-ed so it exists and is empty.
 
-1. Mark the just-completed chunk's todo as `completed` (via `TodoWrite`).
-2. Extract `trailing_buffer` from the previous subagent's response via the marker regex (`===BUFFER===\n(.*?)\n===END===`, DOTALL).
-3. Dispatch the next chunk's subagent with the new offset, `is_final`, and that buffer (set its todo to `in_progress` in the same `TodoWrite` call as step 1, or in a separate one — either works).
+No `Agent` dispatch happens before both are done. The todo list is the loop counter — without it visible in the harness UI, drift becomes invisible to both you and the user. The empty output file lets the per-chunk `wc -w` growth check (below) return 0 on the first dispatch instead of erroring on a missing file. If you find yourself about to dispatch chunk 1 and either is missing, STOP, do them now, then resume.
+
+Between dispatches the main agent does **exactly these five steps**, in this order, on the just-returned subagent response:
+
+1. **Extract buffer** — regex `===BUFFER===\n(.*?)\n===END===` (DOTALL). Record whether the markers were present.
+2. **Echo detector** — compare the extracted buffer to `trailing_buffer_in` (the buffer passed IN to that subagent). If they are byte-equal AND `trailing_buffer_in` was non-empty → `echoed = true`.
+3. **Growth check** — run `wc -w <output_path>` (the ONE Bash command permitted mid-loop). Compute `delta = new_words - prev_words` (track `prev_words`, starts at 0).
+4. **Decide** per the rules in step 5 of the workflow (re-dispatch / abort / advance). Mark the todo `completed` and update `prev_words` ONLY on `advance`.
+5. **Dispatch** the next chunk's subagent with the new offset, `is_final`, and the extracted buffer as the new `trailing_buffer_in`. Set the next chunk's todo `in_progress`.
 
 Everything else is forbidden until **all N chunks have returned**:
 
 - No `Read` on the source, normalized, or output file.
-- No Bash commands of any kind — no `sed`, `cat`, `head`, `tail`, `awk`, `grep`, `wc`, `diff`, `ls`, no peeking at chunk boundaries, no spot-checking the output.
-- No "let me just verify the buffer looks right" — trust the marker regex; if it matches, dispatch.
-- No status narration that requires inspecting content («N слов записано», «чанк завершился на полном предложении») — the main agent has no way to know these without forbidden inspection. A short progress line like "chunk i/N dispatched" is fine.
-- No clarifying questions to the user mid-loop unless a subagent returns a hard failure (missing markers, error).
+- No Bash commands of any kind EXCEPT the single `wc -w <output_path>` for the growth check above — no `sed`, `cat`, `head`, `tail`, `awk`, `grep`, `diff`, `ls`, no other `wc` invocations (no `wc -l`, no `wc` on source/normalized), no peeking at chunk boundaries, no spot-checking the output content.
+- `wc -w` returns ONLY a numeric word count, never content. Reading any portion of the output text mid-loop is forbidden — even `head -c 100`, even one line. The two structural signals (echo, growth) are all the per-chunk verification the main agent gets; do not try to compensate with eyeballing.
+- No status narration that requires inspecting content («чанк завершился на полном предложении») — the main agent has no way to know that without forbidden inspection. A short progress line like "chunk i/N dispatched, delta=+612 words" is fine.
+- No clarifying questions to the user mid-loop unless a chunk has hit the retry cap (step 5).
 
-All verification — `wc -w`, content sanity checks, anything that reads the files — happens **only in step 6**, after the final chunk's subagent has returned. If you feel the urge to look at a file mid-loop, that is the drift this rule exists to prevent. Resist it; the loop is supposed to be boring.
+All other verification — content sanity checks, final source-vs-output word count — happens **only in step 6**, after the final chunk's subagent has returned. If you feel the urge to look at file content mid-loop, that is the drift this rule exists to prevent. Resist it; the loop is supposed to be boring, with two cheap structural signals per chunk and nothing more.
 
 ## Workflow
 
@@ -110,17 +117,18 @@ wc -l "<source-stem>.normalized.txt"
 | …     | …      | 40    | false    |
 | N     | 1+40*(N-1) | 40 | **true** |
 
-### 3a. Create the loop counter (TodoWrite) — STOP gate before any dispatch
+### 3a. Set up loop infrastructure (TodoWrite + touch) — STOP gate before any dispatch
 
-**This step is a hard precondition for step 4. Do not call `Agent` until this `TodoWrite` exists.**
+**Both of these are hard preconditions for step 4. Do not call `Agent` until both are done.**
 
-Call `TodoWrite` exactly once with N items, one per chunk: `Chunk 1/N`, `Chunk 2/N`, …, `Chunk N/N`. All start as `pending`. Mark the first as `in_progress` either in this initial call or together with the first dispatch.
+1. **TodoWrite the loop counter.** Call `TodoWrite` exactly once with N items, one per chunk: `Chunk 1/N`, `Chunk 2/N`, …, `Chunk N/N`. All start as `pending`. Mark the first as `in_progress` either in this initial call or together with the first dispatch.
+2. **Touch the output file.** `touch "<output_path>"` so the file exists empty. The per-chunk growth check (step 5) runs `wc -w <output_path>` after every chunk; without a pre-existing file the first run errors instead of returning 0. Initialize `prev_words = 0` in your head.
 
-Why this is a gate, not an optional bookkeeping aid: without the todo list visible in the harness UI, drift (skipped chunks, off-by-one in offsets, parallel dispatches) becomes invisible to both you and the user. The list is the loop counter that makes any deviation immediately visible.
+Why these are gates, not optional bookkeeping: without the todo list visible in the harness UI, drift (skipped chunks, off-by-one in offsets, parallel dispatches) becomes invisible to both you and the user. Without the empty output file, the growth check fails open on chunk 1. Both must be true before any `Agent` call.
 
-Common failure mode: dispatching chunks 1–2 first and creating the todo list afterwards. That defeats the purpose — by the time the list appears, the early chunks are already past the gate's protection. **If you catch yourself about to call `Agent` for chunk 1 and the todo list does not yet exist, STOP, call `TodoWrite` with all N items first, then proceed.**
+Common failure mode: dispatching chunks 1–2 first and creating the todo list afterwards. That defeats the purpose — by the time the list appears, the early chunks are already past the gate's protection. **If you catch yourself about to call `Agent` for chunk 1 and either gate is missing, STOP, do both now, then proceed.**
 
-Throughout the loop: mark each chunk `completed` immediately after its buffer has been extracted; mark the next one `in_progress` in the same or adjacent `TodoWrite` call.
+Throughout the loop: mark each chunk `completed` ONLY after the step 5 per-chunk verification passes; mark the next one `in_progress` in the same or adjacent `TodoWrite` call.
 
 ### 4. For each chunk: dispatch a Haiku subagent
 
@@ -167,11 +175,31 @@ Exactly three tool calls total: (1) Read of chunk-prompt.md, (2) Read of the chu
 
 That is the entire dispatch prompt. Do not paste the rules from `chunk-prompt.md` into it — defeats the whole point.
 
-### 5. Collect the buffer between chunks
+### 5. Per-chunk verification: extract buffer, echo detector, growth check
 
-After each subagent returns, extract the text between `===BUFFER===` and `===END===` markers (regex: `===BUFFER===\n(.*?)\n===END===` with DOTALL). Pass that string as `trailing_buffer` to the next chunk's subagent. Discard the rest of the subagent's response.
+After each subagent returns, run these three checks in order:
 
-If a subagent response lacks the markers, treat it as a failure — re-dispatch the same chunk with an emphasized reminder about the output format.
+1. **Extract buffer** — regex `===BUFFER===\n(.*?)\n===END===` (DOTALL). Record `markers_present` (bool).
+2. **Echo detector** — `echoed = (extracted_buffer == trailing_buffer_in) AND (trailing_buffer_in != "")`. The echoed-input failure mode means the subagent silent-skipped the chunk — it returned its input unchanged instead of processing forward.
+3. **Growth check** — run `wc -w "<output_path>"`, compute `delta = new_words - prev_words`.
+
+Then decide:
+
+| `delta` | `markers_present` AND NOT `echoed` | Action |
+|---------|------------------------------------|--------|
+| `> 0`   | true (success)                     | **Advance**: mark todo `completed`, set `prev_words = new_words`, dispatch next chunk. |
+| `> 0`   | false (markers missing OR echoed)  | **Abort and report**: file grew with potentially-correct content, but buffer state is corrupted. Re-dispatching would double-write. Tell the user which chunk hit the ambiguous state, the offset, and the file's current word count so they can inspect and decide. Do NOT re-dispatch automatically. |
+| `== 0`  | (any)                              | **Re-dispatch with retry preamble**: subagent did not write to the file, so retrying is safe (no double-write risk). Track retry count per chunk. |
+
+**Retry cap: 2 retries per chunk.** On the 3rd consecutive failure for the same chunk (delta still 0), abort and tell the user — do not keep looping.
+
+**Retry preamble** — prepend this to the standard dispatch template on every retry:
+
+```
+ATTENTION: previous attempt at this chunk failed the silent-skip detector — either no `===BUFFER===` / `===END===` block in your response, OR your output buffer was byte-identical to the input trailing_buffer (echo), OR the output file did not grow at all. All three mean you did not actually process the chunk. Re-read the chunk slice, do the mental work, and write the WRITE-part via a single `tee -a` Bash. The BUFFER-part you return MUST differ from your input trailing_buffer; the file MUST grow.
+```
+
+Discard everything in the subagent's response outside the marker block.
 
 ### 6. Verify preservation and clean up
 
@@ -207,6 +235,9 @@ Do **not** insert a heading or a blank line between paragraphs. One paragraph pe
 | Subagent added `«»`, `—`, `:`, `?`, `!`, etc. | Re-dispatch the chunk with a stronger reminder: ONLY `.` and `,` are allowed. |
 | Subagent deleted filler («э-э», «ну», "um") | Re-dispatch the chunk; filler is part of the speaker's text. |
 | Subagent wrote the full combined text to file AND returned its tail as buffer (boundary duplication) | Re-dispatch with the "TWO DISJOINT parts" framing emphasized: WRITE-part and BUFFER-part are disjoint; the trailing_buffer is held back from this write, not echoed alongside it. |
+| Subagent's returned BUFFER is byte-identical to the input `trailing_buffer` (echo / silent skip) | Caught by main-agent echo-detector in step 5. If `delta == 0` (file didn't grow either) → re-dispatch with the retry preamble, cap 2 retries. If `delta > 0` (file grew with echoed buffer) → abort and report ambiguous state to the user; re-dispatching would double-write. |
+| `wc -w "<output_path>"` did not increase after chunk dispatch (`delta == 0`) | Caught by main-agent growth check in step 5. Subagent silent-skipped — file unchanged, safe to re-dispatch. Cap 2 retries; on 3rd failure abort and report. |
+| Main agent forgot to `touch "<output_path>"` before chunk 1 | Growth check errors on missing file. Catch this at the step 3a gate — `touch` is a precondition equal to `TodoWrite`. |
 | Subagent wrote a helper script (`cat > /tmp/*.py`, `python -c`, `sed`, `awk`, etc.) to "find the cutoff" or "process the text" | Hard violation of the subagent tool whitelist. Re-dispatch with the ALLOWED TOOLS / FORBIDDEN ACTIONS blocks emphasized. Steps 2–5 are mental — no shell, no Python. |
 | Subagent made >2 Reads or >1 Bash call per chunk | Re-dispatch. Exactly two Reads (chunk-prompt.md + chunk slice) and one Bash (`tee -a` heredoc). Anything else is drift. |
 | Main agent inlined the full subagent rules in the dispatch prompt | Defeats the whole reason `chunk-prompt.md` exists — each dispatch then carries ~2k tokens of rules into main-agent context, ballooning past 10 chunks. Re-dispatch with the thin wrapper that just points the subagent to `chunk-prompt.md`. |
@@ -217,7 +248,7 @@ Do **not** insert a heading or a blank line between paragraphs. One paragraph pe
 | Main agent ran chunks in parallel | Sequential only — each chunk needs the previous chunk's buffer. |
 | Main agent skipped the `Bash(tee:*)` pre-check and ran into a permission prompt mid-loop | Always run the local-grep check from "Permissions" before step 4. If absent, edit `.claude/settings.local.json` directly — do not rely on the interactive "always allow" flow. |
 | Main agent read the chunk itself via Read | Re-do: dispatch the subagent with offset/limit/output_path so the chunk text lives in subagent context, not main. |
-| Main agent ran `sed`/`cat`/`head`/`wc`/`Read` between chunk dispatches to "verify" something | Forbidden by "Main agent discipline". Trust the marker regex; verification happens only in step 6. |
+| Main agent ran `sed`/`cat`/`head`/`Read` between chunk dispatches, or ran `wc -l`/`wc` on source/normalized files, or `wc -w` on anything other than `<output_path>` | Forbidden by "Main agent discipline". The only Bash permitted mid-loop is exactly `wc -w "<output_path>"` for the per-chunk growth check; all other inspection is for step 6. |
 | Skipped `fold` because "file looks fine" | Run it anyway. It is idempotent — already-wrapped files pass through. |
 | Lost the last words of a chunk | Subagent must save trailing buffer at non-final chunks. |
 | Subagent response missed the `===BUFFER===` markers | Re-dispatch with output-format reminder emphasized. |
@@ -241,6 +272,9 @@ Do **not** insert a heading or a blank line between paragraphs. One paragraph pe
 | Default output path | `<source-stem>.article.md` next to source |
 | Resolve chunk-prompt.md path | `find . -path '*/formatting-transcript/chunk-prompt.md' -print -quit \| xargs -r realpath` — run once before step 4, cache the absolute path |
 | Dispatch chunk i | `Agent(subagent_type="general-purpose", model="haiku", prompt=<thin wrapper: pointer to chunk-prompt.md absolute path + variables offset=1+40*(i-1), limit=40, trailing_buffer=<prev_buffer>, is_final=(i==N), output_path=...>)` |
+| Pre-touch output file | `touch "<output_path>"` once in step 3a so per-chunk `wc -w` returns 0 instead of erroring |
 | Extract buffer from response | regex `===BUFFER===\n(.*?)\n===END===` (DOTALL) |
+| Per-chunk echo check | `extracted_buffer == trailing_buffer_in AND trailing_buffer_in != ""` → silent skip; if `delta == 0` re-dispatch (cap 2), else abort |
+| Per-chunk growth check | `wc -w "<output_path>"` → `delta = new - prev_words`; if `delta == 0` re-dispatch (cap 2); update `prev_words` only on success |
 | Verify preservation | `wc -w` source vs output, expect ±2% |
 | Clean up | `rm <source-stem>.normalized.txt` after verification passes |
