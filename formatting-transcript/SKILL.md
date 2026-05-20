@@ -136,13 +136,15 @@ Throughout the loop: mark each chunk `completed` ONLY after the step 5 per-chunk
 
 **Why the dispatch prompt is thin**: the subagent's full rules live in `chunk-prompt.md` next to this SKILL.md (~10 KB). Inlining those rules in every `Agent(prompt=...)` call duplicates them N times in the main agent's context — at 20 chunks that is ~40k tokens of pure boilerplate. Instead, the dispatch tells the subagent to Read `chunk-prompt.md` once, and the main agent only carries the per-chunk variables.
 
-**Before the first dispatch** (after the step 3a TodoWrite gate), resolve the absolute path to `chunk-prompt.md` once and reuse it. It lives in the same directory as this `SKILL.md`. If you do not already know the directory:
+**Before the first dispatch** (after the step 3a TodoWrite gate), resolve the absolute path to `chunk-prompt.md` once and reuse it. It lives in the same directory as this `SKILL.md` — i.e. inside the `formatting-transcript/` skill folder, wherever Claude Code loaded the skill from. Do NOT `find .` from the current working directory: the skill almost never lives in the user's project tree. Instead try the conventional skill install locations in priority order — project-local override → user-global → plugin-bundled:
 
 ```bash
-find . -path '*/formatting-transcript/chunk-prompt.md' -print -quit | xargs -r realpath
+realpath ".claude/skills/formatting-transcript/chunk-prompt.md" 2>/dev/null \
+  || realpath "$HOME/.claude/skills/formatting-transcript/chunk-prompt.md" 2>/dev/null \
+  || find "$HOME/.claude/plugins" -path '*/formatting-transcript/chunk-prompt.md' -print -quit 2>/dev/null | xargs -r realpath
 ```
 
-Cache the result. If the file is not found, abort and tell the user — do not inline the prompt.
+Cache the first non-empty result. If all three lookups fail, abort and tell the user — do not inline the prompt or fall back to a tree-wide `find`.
 
 The subagent itself:
 1. Reads `chunk-prompt.md` once (its only Read of the rules file)
@@ -270,7 +272,7 @@ Do **not** insert a heading or a blank line between paragraphs. One paragraph pe
 | Total lines | `wc -l <source-stem>.normalized.txt` |
 | Number of chunks | `N = ceil(total_lines / 40)` |
 | Default output path | `<source-stem>.article.md` next to source |
-| Resolve chunk-prompt.md path | `find . -path '*/formatting-transcript/chunk-prompt.md' -print -quit \| xargs -r realpath` — run once before step 4, cache the absolute path |
+| Resolve chunk-prompt.md path | Try `./.claude/skills/.../chunk-prompt.md` → `~/.claude/skills/.../chunk-prompt.md` → `find ~/.claude/plugins -path '*/formatting-transcript/chunk-prompt.md'`. Skill lives where Claude Code installed it, NOT in the project tree. Full one-liner in step 4; run once, cache the absolute path. |
 | Dispatch chunk i | `Agent(subagent_type="general-purpose", model="haiku", prompt=<thin wrapper: pointer to chunk-prompt.md absolute path + variables offset=1+40*(i-1), limit=40, trailing_buffer=<prev_buffer>, is_final=(i==N), output_path=...>)` |
 | Pre-touch output file | `touch "<output_path>"` once in step 3a so per-chunk `wc -w` returns 0 instead of erroring |
 | Extract buffer from response | regex `===BUFFER===\n(.*?)\n===END===` (DOTALL) |
