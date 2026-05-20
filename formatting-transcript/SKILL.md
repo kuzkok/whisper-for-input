@@ -13,7 +13,15 @@ Convert a raw transcript file (`.txt`, `.vtt`/`.srt` body, plain auto-captions, 
 
 Per-chunk processing happens in a Haiku subagent so the main session's context stays bounded and the run is several times faster than processing inline on Opus.
 
-**Permissions**: each chunk's subagent appends to the output via `tee -a`. To avoid a permission prompt per chunk, ensure `Bash(tee:*)` is in `.claude/settings.local.json` under `permissions.allow` before starting. If absent, the first chunk will prompt — the user can click "always allow" once and continue.
+**Permissions**: each chunk's subagent appends to the output via `tee -a`. To avoid a permission prompt per chunk, `Bash(tee:*)` must be in **the current project's** `.claude/settings.local.json` under `permissions.allow`. User-level (`~/.claude/settings.json`) is intentionally NOT used — granting `tee` unconditionally for every project is too broad. The check is local-only by design.
+
+**Before any chunk dispatch, the main agent MUST verify the rule is present locally**:
+
+```bash
+grep -q '"Bash(tee:\*)"' .claude/settings.local.json 2>/dev/null && echo present || echo missing
+```
+
+If `missing`, ask the user once: "Add `Bash(tee:*)` to this project's `.claude/settings.local.json`? Otherwise every chunk will prompt." On confirmation, edit the file directly (create it if absent, with `{"permissions": {"allow": ["Bash(tee:*)"]}}`) — do not rely on Claude Code's interactive "always allow" flow, which sometimes asks twice (once for project scope, once for user scope) and the second prompt can land mid-loop. A direct edit before dispatch is unambiguous.
 
 ## When to use
 
@@ -49,10 +57,15 @@ Per-chunk processing happens in a Haiku subagent so the main session's context s
 
 ## Main agent discipline — no detours between chunks
 
-The chunk loop must be deterministic, like a `for` loop in a script. Between dispatches the main agent does **exactly two operations**, in this order:
+The chunk loop must be deterministic, like a `for` loop in a script.
 
-1. Extract `trailing_buffer` from the previous subagent's response via the marker regex (`===BUFFER===\n(.*?)\n===END===`, DOTALL).
-2. Dispatch the next chunk's subagent with the new offset, `is_final`, and that buffer.
+**Hard precondition before step 4 (first chunk dispatch): a `TodoWrite` call with exactly N items (`Chunk 1/N` … `Chunk N/N`) has already been made.** No `Agent` dispatch happens before that. The todo list is the loop counter — without it visible in the harness UI, drift becomes invisible to both you and the user. If you find yourself about to dispatch chunk 1 and the todo list doesn't exist yet, STOP, call `TodoWrite` with all N items at once, then resume.
+
+Between dispatches the main agent does **exactly three operations**, in this order:
+
+1. Mark the just-completed chunk's todo as `completed` (via `TodoWrite`).
+2. Extract `trailing_buffer` from the previous subagent's response via the marker regex (`===BUFFER===\n(.*?)\n===END===`, DOTALL).
+3. Dispatch the next chunk's subagent with the new offset, `is_final`, and that buffer (set its todo to `in_progress` in the same `TodoWrite` call as step 1, or in a separate one — either works).
 
 Everything else is forbidden until **all N chunks have returned**:
 
@@ -97,7 +110,17 @@ wc -l "<source-stem>.normalized.txt"
 | …     | …      | 40    | false    |
 | N     | 1+40*(N-1) | 40 | **true** |
 
-Create a `TodoWrite` list with exactly N items, one per chunk (`Chunk 1/N`, `Chunk 2/N`, …, `Chunk N/N`). Mark each one completed the moment the buffer has been extracted and the next dispatch is queued. The todo list is the loop counter — it locks the main agent into the for-loop shape and makes any detour visually obvious.
+### 3a. Create the loop counter (TodoWrite) — STOP gate before any dispatch
+
+**This step is a hard precondition for step 4. Do not call `Agent` until this `TodoWrite` exists.**
+
+Call `TodoWrite` exactly once with N items, one per chunk: `Chunk 1/N`, `Chunk 2/N`, …, `Chunk N/N`. All start as `pending`. Mark the first as `in_progress` either in this initial call or together with the first dispatch.
+
+Why this is a gate, not an optional bookkeeping aid: without the todo list visible in the harness UI, drift (skipped chunks, off-by-one in offsets, parallel dispatches) becomes invisible to both you and the user. The list is the loop counter that makes any deviation immediately visible.
+
+Common failure mode: dispatching chunks 1–2 first and creating the todo list afterwards. That defeats the purpose — by the time the list appears, the early chunks are already past the gate's protection. **If you catch yourself about to call `Agent` for chunk 1 and the todo list does not yet exist, STOP, call `TodoWrite` with all N items first, then proceed.**
+
+Throughout the loop: mark each chunk `completed` immediately after its buffer has been extracted; mark the next one `in_progress` in the same or adjacent `TodoWrite` call.
 
 ### 4. For each chunk: dispatch a Haiku subagent
 
@@ -261,7 +284,9 @@ Do **not** insert a heading or a blank line between paragraphs. One paragraph pe
 | Subagent used `Write` / `Edit` / created temp files | Re-dispatch. The only file write is the single `tee -a` to `output_path`. |
 | Subagent used `cat <<'EOF' \| tee -a ...` (heredoc piped through `cat` into `tee`) — triggers per-chunk permission prompt | Permission analyzer matches `Bash(tee:*)` only when the command's first word is `tee`. Re-dispatch with the CORRECT vs WRONG block emphasized: heredoc must be the DIRECT stdin of `tee -a`, no `cat` prefix, no pipe. |
 | Subagent used `>>` redirection (`cat <<'EOF' >> "<path>"`) | Same root cause — redirection isn't allowed by the `Bash(tee:*)` rule and prompts per chunk. Re-dispatch using direct `tee -a "<path>" <<'OUT_EOF' ... OUT_EOF`. |
+| Main agent dispatched chunk 1 (or 1–2) before calling `TodoWrite` | Violates the step 3a gate. The todo list is the loop counter — it must exist BEFORE any `Agent` call. Catch yourself, call `TodoWrite` with all N items now, mark already-processed chunks as `completed`, then continue. |
 | Main agent ran chunks in parallel | Sequential only — each chunk needs the previous chunk's buffer. |
+| Main agent skipped the `Bash(tee:*)` pre-check and ran into a permission prompt mid-loop | Always run the local-grep check from "Permissions" before step 4. If absent, edit `.claude/settings.local.json` directly — do not rely on the interactive "always allow" flow. |
 | Main agent read the chunk itself via Read | Re-do: dispatch the subagent with offset/limit/output_path so the chunk text lives in subagent context, not main. |
 | Main agent ran `sed`/`cat`/`head`/`wc`/`Read` between chunk dispatches to "verify" something | Forbidden by "Main agent discipline". Trust the marker regex; verification happens only in step 6. |
 | Skipped `fold` because "file looks fine" | Run it anyway. It is idempotent — already-wrapped files pass through. |
