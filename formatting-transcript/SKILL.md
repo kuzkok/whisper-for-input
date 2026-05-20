@@ -207,23 +207,45 @@ INPUT:
 - is_final: <true|false>
 - output_path: <ABSOLUTE_PATH_TO_OUTPUT_FILE>
 
+OUTPUT MODEL — TWO DISJOINT parts (read this before STEPS):
+
+The combined text (trailing_buffer + chunk_text) is split into TWO DISJOINT parts at the cut point:
+- WRITE-part: everything BEFORE the cut. Goes ONLY into the `tee -a` heredoc.
+- BUFFER-part: everything AFTER the cut. Goes ONLY between `===BUFFER===` markers.
+
+No word may appear in both parts. The trailing_buffer you RETURN must NOT appear at the end of what you WROTE. The BUFFER-part is text HELD BACK from this write so the next chunk can prepend it; it is NOT a copy of the tail you also send to the file. Writing the full combined text AND also returning its tail as buffer duplicates the boundary on every chunk and is the single most common silent bug in this skill.
+
+For the final chunk (`is_final: true`): WRITE-part is the entire combined text (with a terminal period if missing); BUFFER-part is empty.
+
 STEPS (steps 2–5 are done in your head — NO tool calls between Read and tee):
 1. [TOOL: Read] `Read(normalized_path, offset, limit)`. Strip the `cat -n` line-number prefix that Read adds (everything before the tab on each line). Join the lines with single spaces. This is your only Read.
-2. [MENTAL] Prepend the trailing_buffer (with a space separator if both are non-empty) to form the chunk text.
+2. [MENTAL] Prepend the trailing_buffer (with a space separator if both are non-empty) to form the combined text.
 3. [MENTAL] Add `.` and `,` per the rules. Group into paragraphs.
-4. [MENTAL] If is_final is false: pick the cut point yourself by reading the text — find the last sentence that ends on a clear terminal word and a complete thought. Everything after that point is the NEW trailing_buffer. If the text ends on a conjunction (`и`, `или`, `но`, `а`, `что`, `чтобы`, `that`, `because`, `so`), a preposition (`в`, `на`, `с`, `к`, `in`, `on`, `with`, `for`), an article (`the`, `a`, `an`), or any grammatically incomplete fragment, save more to the buffer. When in doubt, save more. **This is a linguistic judgment you make directly — do not write a script, regex, or `rfind` lookup to find the cut.**
-5. [MENTAL] If is_final is true: terminate the last sentence with a period if it lacks one. The whole text is finished; the new trailing_buffer is empty.
-6. [TOOL: Bash] Append the finished paragraphs to output_path with ONE Bash heredoc (use `tee -a`, NOT `cat >>` — `>>` triggers Claude Code's write-redirection check and prompts per chunk):
+4. [MENTAL] Choose the cut point and split the combined text into the TWO DISJOINT parts:
+   - If `is_final` is false: pick the cut point yourself by reading the text — find the last sentence that ends on a clear terminal word and a complete thought. Everything BEFORE that point is the **WRITE-part**. Everything AFTER that point is the **BUFFER-part** (= the new trailing_buffer). If the text ends on a conjunction (`и`, `или`, `но`, `а`, `что`, `чтобы`, `that`, `because`, `so`), a preposition (`в`, `на`, `с`, `к`, `in`, `on`, `with`, `for`), an article (`the`, `a`, `an`), or any grammatically incomplete fragment, move more material from WRITE-part into BUFFER-part. When in doubt, save more to BUFFER-part. **Linguistic judgment — do not write a script, regex, or `rfind` lookup to find the cut.**
+   - If `is_final` is true: WRITE-part is the entire combined text (terminate the last sentence with a period if it lacks one); BUFFER-part is empty.
+5. [MENTAL] Verify the disjoint property: the WRITE-part and BUFFER-part share NO overlapping words. The last words of WRITE-part are NOT the same as BUFFER-part. If they overlap, you split wrong — re-do the cut so each word belongs to exactly one part.
+
+Example. Combined text: `"Первый тезис. Второй тезис. Третий не закон"`
+Cut after `"Второй тезис."`:
+- WRITE-part (goes into `tee -a`): `"Первый тезис. Второй тезис."`
+- BUFFER-part (goes into `===BUFFER===`): `"Третий не закон"`
+
+Output file gains `"Первый тезис. Второй тезис.\n"` — and NOTHING from `"Третий не закон"`. The next chunk's subagent will prepend `"Третий не закон"` to its own chunk_text and continue.
+
+6. [TOOL: Bash] **Self-check before issuing the `tee -a` call**: compare the last ~10 words of the WRITE-part (what you are about to write) against the BUFFER-part (what you will emit between `===BUFFER===` markers). They MUST be different — no shared trailing phrase. If they match, you are about to duplicate the boundary on the next chunk — go back to step 4 and fix the split before issuing the tool call.
+
+   Then append the WRITE-part to output_path with ONE Bash heredoc (use `tee -a`, NOT `cat >>` — `>>` triggers Claude Code's write-redirection check and prompts per chunk):
    ```
    tee -a "<output_path>" <<'OUT_EOF'
-   <finished paragraphs, ONE paragraph per line, no blank lines between them>
+   <WRITE-part as finished paragraphs, ONE paragraph per line, no blank lines between them>
    OUT_EOF
    ```
-   No leading blank line. Each paragraph is one line; paragraphs are separated by a single `\n`. The heredoc's trailing newline cleanly separates this chunk's last paragraph from the next chunk's first paragraph (still single-newline). `tee -a` echoes content to stdout — harmless, just appears in the tool result. This is your only Bash call.
-7. End your response with EXACTLY these three lines (and nothing else after):
+   The heredoc body is **only the WRITE-part** — do NOT include the BUFFER-part here. No leading blank line. Each paragraph is one line; paragraphs are separated by a single `\n`. The heredoc's trailing newline cleanly separates this chunk's last paragraph from the next chunk's first paragraph (still single-newline). `tee -a` echoes content to stdout — harmless, just appears in the tool result. This is your only Bash call.
+7. End your response with EXACTLY these three lines (and nothing else after). The buffer string is the **BUFFER-part** from step 4 — nothing else:
    ```
    ===BUFFER===
-   <trailing buffer string, or blank line if final>
+   <BUFFER-part, or blank line if is_final was true>
    ===END===
    ```
 
@@ -236,6 +258,7 @@ SUBAGENT RED FLAGS — if any of these thoughts arise, STOP and just do the ment
 - "I'll split this into two `tee -a` calls so each paragraph is separate" → No. One heredoc with all paragraphs.
 - "`cat <<'EOF' | tee -a "..."` is the same thing, more idiomatic" → No. The first word of your Bash command must be `tee`. The pipeline form fails the static permission check and prompts the user per chunk, breaking the unattended run.
 - "I'll use `>>` redirection, it's simpler than `tee -a`" → No. `>>` is treated as a write operation by Claude Code's permission system and prompts the user per chunk. Use `tee -a` and only `tee -a`.
+- "I'll write the full combined text to the file AND return its tail as buffer, just to be safe" → No. WRITE-part and BUFFER-part are DISJOINT. The buffer is text HELD BACK from this write, not echoed alongside it. Writing both duplicates the boundary on every chunk — a silent bug that compounds across N chunks.
 
 If you find yourself reaching for any forbidden tool: that is the violation this prompt exists to prevent. The Iron Law of this skill is that processing happens in your head; tools only ferry text in (Read) and out (tee -a).
 ```
@@ -279,6 +302,7 @@ Do **not** insert a heading or a blank line between paragraphs. One paragraph pe
 |---------|-----|
 | Subagent added `«»`, `—`, `:`, `?`, `!`, etc. | Re-dispatch the chunk with a stronger reminder: ONLY `.` and `,` are allowed. |
 | Subagent deleted filler («э-э», «ну», "um") | Re-dispatch the chunk; filler is part of the speaker's text. |
+| Subagent wrote the full combined text to file AND returned its tail as buffer (boundary duplication) | Re-dispatch with the "TWO DISJOINT parts" framing emphasized: WRITE-part and BUFFER-part are disjoint; the trailing_buffer is held back from this write, not echoed alongside it. |
 | Subagent wrote a helper script (`cat > /tmp/*.py`, `python -c`, `sed`, `awk`, etc.) to "find the cutoff" or "process the text" | Hard violation of the subagent tool whitelist. Re-dispatch with the ALLOWED TOOLS / FORBIDDEN ACTIONS blocks emphasized. Steps 2–5 are mental — no shell, no Python. |
 | Subagent made >1 Read or >1 Bash call per chunk | Re-dispatch. Exactly one Read (load chunk) and one Bash (`tee -a` heredoc). Anything else is drift. |
 | Subagent used `Write` / `Edit` / created temp files | Re-dispatch. The only file write is the single `tee -a` to `output_path`. |
@@ -300,6 +324,7 @@ Do **not** insert a heading or a blank line between paragraphs. One paragraph pe
 - "I'll merge these two near-identical sentences" → No. The speaker said both.
 - "A heading here would help structure" → No. Paragraphs only, unless user explicitly asked.
 - "Word count is off by 10%" → Content was changed. Find what was removed or invented.
+- "The same phrase appears at the end of chunk N and start of chunk N+1" → Boundary duplication. The subagent wrote the trailing_buffer to the file instead of holding it back. WRITE-part and BUFFER-part must be disjoint.
 
 ## Quick reference
 
