@@ -131,17 +131,50 @@ RULES (Iron Law: preserve every word of the source in the same order):
 
 ALLOWED TOOLS (exhaustive whitelist — you may use ONLY these two tool calls, in this order, and nothing else):
 1. ONE `Read(normalized_path, offset, limit)` call to load your chunk.
-2. ONE `Bash` call: a single `tee -a "<output_path>" <<'OUT_EOF' ... OUT_EOF` heredoc to append the finished paragraphs.
+2. ONE `Bash` call whose command **literally starts with the word `tee `** — specifically `tee -a "<output_path>" <<'OUT_EOF' ... OUT_EOF`. The very first token of the shell command is `tee`. No prefix command, no pipe, no command substitution, no parentheses, no `cat`, no `echo`, no `printf`.
 
 Total tool calls per run: exactly 2. No exceptions. After that, end your response with the buffer marker block (text only, not a tool call).
+
+Why "starts with `tee`": Claude Code's permission analyzer matches `Bash(tee:*)` only when the command's first word is `tee`. Any prefix (e.g. `cat <<EOF | tee -a ...`) makes the analyzer see `cat` instead of `tee`, fails the static check, and forces a per-chunk permission prompt that breaks the unattended run.
 
 FORBIDDEN ACTIONS (any one of these is a hard failure — abort and return an error instead of doing them):
 - Do NOT write or execute scripts of any kind. No `python`, no `python3`, no `node`, no `perl`, no `ruby`, no inline `-c '...'`.
 - Do NOT use text-processing utilities: no `sed`, `awk`, `grep`, `cut`, `tr`, `sort`, `uniq`, `head`, `tail`, `cat`, `wc`, `diff`, `fold`, `xargs`.
+- Do NOT use shell pipelines (`|`), command substitution (`$(...)` / backticks), subshells (`(...)`), redirection operators other than the heredoc on `tee` (no `>`, `>>`, `<`, `2>&1`), and no command chaining (`&&`, `||`, `;`). Your Bash command is a single `tee -a ... <<'OUT_EOF' ... OUT_EOF` invocation, nothing more.
+- Do NOT prefix the heredoc with `cat`: `cat <<'EOF' | tee -a ...` is **wrong** even though it would write the file — the leading `cat` breaks Claude Code's static permission check. Feed the heredoc DIRECTLY to `tee`: `tee -a "<path>" <<'OUT_EOF' ... OUT_EOF`.
 - Do NOT create scratch / helper / temporary files. No `cat > /tmp/...`, no `Write`, no `Edit`, no `mkdir`, no `touch`. The only file you write to is `output_path`, via the single `tee -a` heredoc.
 - Do NOT make multiple `Read` calls. One chunk = one Read. Do not re-read to "double-check".
 - Do NOT make multiple `Bash` calls. One chunk = one `tee -a` call. Do not split paragraphs across calls.
 - Do NOT shell out to "find the cutoff point" or "count words" or "verify the buffer". Steps 2–5 below are mental operations on the chunk text inside your own response; they do not use tools.
+
+CORRECT vs WRONG Bash command shape:
+
+✅ CORRECT (first word is `tee`, heredoc is the direct stdin):
+```
+tee -a "/abs/path/output.md" <<'OUT_EOF'
+Первый абзац.
+Второй абзац.
+OUT_EOF
+```
+
+❌ WRONG (first word is `cat`, pipeline triggers permission prompt):
+```
+cat <<'EOF' | tee -a "/abs/path/output.md"
+Первый абзац.
+EOF
+```
+
+❌ WRONG (uses `>>` redirection, also triggers permission prompt):
+```
+cat <<'EOF' >> "/abs/path/output.md"
+Первый абзац.
+EOF
+```
+
+❌ WRONG (`echo` prefix):
+```
+echo "Первый абзац." | tee -a "/abs/path/output.md"
+```
 
 INPUT:
 - normalized_path: <ABSOLUTE_PATH_TO_NORMALIZED_FILE>
@@ -178,6 +211,8 @@ SUBAGENT RED FLAGS — if any of these thoughts arise, STOP and just do the ment
 - "I'll do a `Read` again to double-check the chunk" → No. One Read per chunk.
 - "Let me `wc -w` to verify the buffer is right size" → No. Trust your judgment; main agent verifies at the end.
 - "I'll split this into two `tee -a` calls so each paragraph is separate" → No. One heredoc with all paragraphs.
+- "`cat <<'EOF' | tee -a "..."` is the same thing, more idiomatic" → No. The first word of your Bash command must be `tee`. The pipeline form fails the static permission check and prompts the user per chunk, breaking the unattended run.
+- "I'll use `>>` redirection, it's simpler than `tee -a`" → No. `>>` is treated as a write operation by Claude Code's permission system and prompts the user per chunk. Use `tee -a` and only `tee -a`.
 
 If you find yourself reaching for any forbidden tool: that is the violation this prompt exists to prevent. The Iron Law of this skill is that processing happens in your head; tools only ferry text in (Read) and out (tee -a).
 ```
@@ -224,6 +259,8 @@ Do **not** insert a heading or a blank line between paragraphs. One paragraph pe
 | Subagent wrote a helper script (`cat > /tmp/*.py`, `python -c`, `sed`, `awk`, etc.) to "find the cutoff" or "process the text" | Hard violation of the subagent tool whitelist. Re-dispatch with the ALLOWED TOOLS / FORBIDDEN ACTIONS blocks emphasized. Steps 2–5 are mental — no shell, no Python. |
 | Subagent made >1 Read or >1 Bash call per chunk | Re-dispatch. Exactly one Read (load chunk) and one Bash (`tee -a` heredoc). Anything else is drift. |
 | Subagent used `Write` / `Edit` / created temp files | Re-dispatch. The only file write is the single `tee -a` to `output_path`. |
+| Subagent used `cat <<'EOF' \| tee -a ...` (heredoc piped through `cat` into `tee`) — triggers per-chunk permission prompt | Permission analyzer matches `Bash(tee:*)` only when the command's first word is `tee`. Re-dispatch with the CORRECT vs WRONG block emphasized: heredoc must be the DIRECT stdin of `tee -a`, no `cat` prefix, no pipe. |
+| Subagent used `>>` redirection (`cat <<'EOF' >> "<path>"`) | Same root cause — redirection isn't allowed by the `Bash(tee:*)` rule and prompts per chunk. Re-dispatch using direct `tee -a "<path>" <<'OUT_EOF' ... OUT_EOF`. |
 | Main agent ran chunks in parallel | Sequential only — each chunk needs the previous chunk's buffer. |
 | Main agent read the chunk itself via Read | Re-do: dispatch the subagent with offset/limit/output_path so the chunk text lives in subagent context, not main. |
 | Main agent ran `sed`/`cat`/`head`/`wc`/`Read` between chunk dispatches to "verify" something | Forbidden by "Main agent discipline". Trust the marker regex; verification happens only in step 6. |
