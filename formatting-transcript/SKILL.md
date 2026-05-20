@@ -71,8 +71,8 @@ Between dispatches the main agent does **exactly these five steps**, in this ord
 1. **Extract buffer** — regex `===BUFFER===\n(.*?)\n===END===` (DOTALL). Record whether the markers were present.
 2. **Echo detector** — compare the extracted buffer to `trailing_buffer_in` (the buffer passed IN to that subagent). If they are byte-equal AND `trailing_buffer_in` was non-empty → `echoed = true`.
 3. **Growth check** — run `wc -w <output_path>` (the ONE Bash command permitted mid-loop). Compute `delta = new_words - prev_words` (track `prev_words`, starts at 0).
-4. **Decide** per the rules in step 5 of the workflow (re-dispatch / abort / advance). Mark the todo `completed` and update `prev_words` ONLY on `advance`.
-5. **Dispatch** the next chunk's subagent with the new offset, `is_final`, and the extracted buffer as the new `trailing_buffer_in`. Set the next chunk's todo `in_progress`.
+4. **Decide** per the rules in step 5 of the workflow (re-dispatch / abort / advance). On `advance`: update `prev_words`, then mark the current chunk `completed` AND the next chunk `in_progress` in **ONE combined `TodoWrite` call** — not two. Each TodoWrite serializes the full N-item list both ways, so a needless second call doubles the per-chunk bookkeeping cost (~900 → ~1800 tokens at N=20).
+5. **Dispatch** the next chunk's subagent with the new offset, `is_final`, and the extracted buffer as the new `trailing_buffer_in`. The TodoWrite from step 4 has already set its status — do NOT issue another TodoWrite here.
 
 Everything else is forbidden until **all N chunks have returned**:
 
@@ -128,7 +128,7 @@ Why these are gates, not optional bookkeeping: without the todo list visible in 
 
 Common failure mode: dispatching chunks 1–2 first and creating the todo list afterwards. That defeats the purpose — by the time the list appears, the early chunks are already past the gate's protection. **If you catch yourself about to call `Agent` for chunk 1 and either gate is missing, STOP, do both now, then proceed.**
 
-Throughout the loop: mark each chunk `completed` ONLY after the step 5 per-chunk verification passes; mark the next one `in_progress` in the same or adjacent `TodoWrite` call.
+Throughout the loop: mark each chunk `completed` ONLY after the step 5 per-chunk verification passes; mark the next one `in_progress` in **the SAME** `TodoWrite` call (one combined call per transition, not two). TodoWrite carries the full N-item list each direction, so a redundant call per chunk ≈ ~900 tokens of pure bookkeeping overhead at N=20.
 
 ### 4. For each chunk: dispatch a Haiku subagent
 
@@ -248,6 +248,7 @@ Do **not** insert a heading or a blank line between paragraphs. One paragraph pe
 | Subagent used `cat <<'EOF' \| tee -a ...` (heredoc piped through `cat` into `tee`) — triggers per-chunk permission prompt | Permission analyzer matches `Bash(tee:*)` only when the command's first word is `tee`. Re-dispatch with the CORRECT vs WRONG block emphasized: heredoc must be the DIRECT stdin of `tee -a`, no `cat` prefix, no pipe. |
 | Subagent used `>>` redirection (`cat <<'EOF' >> "<path>"`) | Same root cause — redirection isn't allowed by the `Bash(tee:*)` rule and prompts per chunk. Re-dispatch using direct `tee -a "<path>" <<'OUT_EOF' ... OUT_EOF`. |
 | Main agent dispatched chunk 1 (or 1–2) before calling `TodoWrite` | Violates the step 3a gate. The todo list is the loop counter — it must exist BEFORE any `Agent` call. Catch yourself, call `TodoWrite` with all N items now, mark already-processed chunks as `completed`, then continue. |
+| Main agent issued TWO separate `TodoWrite` calls per chunk transition (one to mark current `completed`, another to mark next `in_progress`) | Doubles per-chunk overhead — each TodoWrite serializes the full N-item list both ways (~900 tokens at N=20), so a needless second call costs ~900 tokens × N chunks of pure bookkeeping. ONE combined call per transition (both status flips at once) is the rule. |
 | Main agent ran chunks in parallel | Sequential only — each chunk needs the previous chunk's buffer. |
 | Main agent skipped the `Bash(tee:*)` pre-check and ran into a permission prompt mid-loop | Always run the local-grep check from "Permissions" before step 4. If absent, edit `.claude/settings.local.json` directly — do not rely on the interactive "always allow" flow. |
 | Main agent read the chunk itself via Read | Re-do: dispatch the subagent with offset/limit/output_path so the chunk text lives in subagent context, not main. |
