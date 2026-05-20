@@ -126,80 +126,35 @@ Throughout the loop: mark each chunk `completed` immediately after its buffer ha
 
 **Sequentially** (NOT in parallel — each subagent needs the trailing buffer from the previous one), dispatch a subagent using the `Agent` tool with `subagent_type: "general-purpose"` and `model: "haiku"`.
 
+**Why the dispatch prompt is thin**: the subagent's full rules live in `chunk-prompt.md` next to this SKILL.md (~10 KB). Inlining those rules in every `Agent(prompt=...)` call duplicates them N times in the main agent's context — at 20 chunks that is ~40k tokens of pure boilerplate. Instead, the dispatch tells the subagent to Read `chunk-prompt.md` once, and the main agent only carries the per-chunk variables.
+
+**Before the first dispatch** (after the step 3a TodoWrite gate), resolve the absolute path to `chunk-prompt.md` once and reuse it. It lives in the same directory as this `SKILL.md`. If you do not already know the directory:
+
+```bash
+find . -path '*/formatting-transcript/chunk-prompt.md' -print -quit | xargs -r realpath
+```
+
+Cache the result. If the file is not found, abort and tell the user — do not inline the prompt.
+
 The subagent itself:
-1. Reads its own chunk slice via `Read(<normalized_path>, offset, limit)` — main agent does NOT read the chunk
-2. Prepends the trailing buffer from the previous chunk (empty for chunk 1)
-3. Adds `.`, `,`, paragraph breaks per the rules
-4. Appends the finished paragraphs to the output file via Bash `tee -a ... <<'EOF'` heredoc (use `tee -a`, NOT `cat >>` — Claude Code's permission system treats shell redirection `>>` as a "write operation" requiring per-file approval; `tee -a` writes via its file argument and is permitted by a single `Bash(tee:*)` rule)
-5. Returns ONLY the trailing buffer string (or empty for the final chunk)
+1. Reads `chunk-prompt.md` once (its only Read of the rules file)
+2. Reads its own chunk slice via `Read(<normalized_path>, offset, limit)` — main agent does NOT read the chunk
+3. Prepends the trailing buffer from the previous chunk (empty for chunk 1)
+4. Adds `.`, `,`, paragraph breaks per the rules
+5. Appends the finished paragraphs to the output file via Bash `tee -a ... <<'EOF'` heredoc (use `tee -a`, NOT `cat >>` — Claude Code's permission system treats shell redirection `>>` as a "write operation" requiring per-file approval; `tee -a` writes via its file argument and is permitted by a single `Bash(tee:*)` rule)
+6. Returns ONLY the trailing buffer string (or empty for the final chunk) between `===BUFFER===` / `===END===` markers
 
-This bounds the main agent's context to dispatch params + the short buffer string between chunks. The chunk content and processed paragraphs never enter the main agent's context.
+This bounds the main agent's context to a small dispatch wrapper (~200 tokens) + the short buffer string between chunks. The chunk content, processed paragraphs, and rules themselves never enter the main agent's context.
 
-#### Subagent prompt template
+#### Subagent dispatch prompt template
 
-Substitute the bracketed values per chunk:
+Thin wrapper — the actual rules live in `chunk-prompt.md`. Substitute the bracketed values per chunk:
 
 ```
-You are formatting one chunk of a raw transcript. Follow the rules and tool whitelist below exactly. Do not improvise.
+You are a Haiku subagent for the formatting-transcript skill. First, Read the rules at:
+  <ABSOLUTE_PATH_TO_CHUNK_PROMPT_MD>
 
-RULES (Iron Law: preserve every word of the source in the same order):
-- Add ONLY `.` and `,`. No other punctuation marks: no `?`, `!`, `:`, `;`, `—`, `«»`, `""`, `''`, `()`, `[]`.
-- Separate paragraphs with a SINGLE newline (`\n`), NOT a blank line (`\n\n`). One paragraph per line. ~3–7 sentences per paragraph; more is OK if the speaker stays on one topic.
-- Capitalize sentence starts and proper nouns.
-- Preserve EVERY source word in original order. Filler words, colloquialisms, repeated words, typos — all stay.
-- Preserve `[музыка]` / `[music]` markers verbatim.
-- Preserve any existing punctuation in the source as-is. Do not change `?` to `.`, do not strip existing quotes or dashes.
-- Tech terms stay verbatim (`React`, `Docker`, `Kubernetes`, `npm install`).
-- No headings (`#`, `##`, `###`).
-
-ALLOWED TOOLS (exhaustive whitelist — you may use ONLY these two tool calls, in this order, and nothing else):
-1. ONE `Read(normalized_path, offset, limit)` call to load your chunk.
-2. ONE `Bash` call whose command **literally starts with the word `tee `** — specifically `tee -a "<output_path>" <<'OUT_EOF' ... OUT_EOF`. The very first token of the shell command is `tee`. No prefix command, no pipe, no command substitution, no parentheses, no `cat`, no `echo`, no `printf`.
-
-Total tool calls per run: exactly 2. No exceptions. After that, end your response with the buffer marker block (text only, not a tool call).
-
-Why "starts with `tee`": Claude Code's permission analyzer matches `Bash(tee:*)` only when the command's first word is `tee`. Any prefix (e.g. `cat <<EOF | tee -a ...`) makes the analyzer see `cat` instead of `tee`, fails the static check, and forces a per-chunk permission prompt that breaks the unattended run.
-
-FORBIDDEN ACTIONS (any one of these is a hard failure — abort and return an error instead of doing them):
-- Do NOT write or execute scripts of any kind. No `python`, no `python3`, no `node`, no `perl`, no `ruby`, no inline `-c '...'`.
-- Do NOT use text-processing utilities: no `sed`, `awk`, `grep`, `cut`, `tr`, `sort`, `uniq`, `head`, `tail`, `cat`, `wc`, `diff`, `fold`, `xargs`.
-- Do NOT use shell pipelines (`|`), command substitution (`$(...)` / backticks), subshells (`(...)`), redirection operators other than the heredoc on `tee` (no `>`, `>>`, `<`, `2>&1`), and no command chaining (`&&`, `||`, `;`). Your Bash command is a single `tee -a ... <<'OUT_EOF' ... OUT_EOF` invocation, nothing more.
-- Do NOT prefix the heredoc with `cat`: `cat <<'EOF' | tee -a ...` is **wrong** even though it would write the file — the leading `cat` breaks Claude Code's static permission check. Feed the heredoc DIRECTLY to `tee`: `tee -a "<path>" <<'OUT_EOF' ... OUT_EOF`.
-- Do NOT create scratch / helper / temporary files. No `cat > /tmp/...`, no `Write`, no `Edit`, no `mkdir`, no `touch`. The only file you write to is `output_path`, via the single `tee -a` heredoc.
-- Do NOT make multiple `Read` calls. One chunk = one Read. Do not re-read to "double-check".
-- Do NOT make multiple `Bash` calls. One chunk = one `tee -a` call. Do not split paragraphs across calls.
-- Do NOT shell out to "find the cutoff point" or "count words" or "verify the buffer". Steps 2–5 below are mental operations on the chunk text inside your own response; they do not use tools.
-
-CORRECT vs WRONG Bash command shape:
-
-✅ CORRECT (first word is `tee`, heredoc is the direct stdin):
-```
-tee -a "/abs/path/output.md" <<'OUT_EOF'
-Первый абзац.
-Второй абзац.
-OUT_EOF
-```
-
-❌ WRONG (first word is `cat`, pipeline triggers permission prompt):
-```
-cat <<'EOF' | tee -a "/abs/path/output.md"
-Первый абзац.
-EOF
-```
-
-❌ WRONG (uses `>>` redirection, also triggers permission prompt):
-```
-cat <<'EOF' >> "/abs/path/output.md"
-Первый абзац.
-EOF
-```
-
-❌ WRONG (`echo` prefix):
-```
-echo "Первый абзац." | tee -a "/abs/path/output.md"
-```
-
-INPUT:
+Then execute on this chunk with these inputs:
 - normalized_path: <ABSOLUTE_PATH_TO_NORMALIZED_FILE>
 - offset: <OFFSET>
 - limit: 40
@@ -207,61 +162,10 @@ INPUT:
 - is_final: <true|false>
 - output_path: <ABSOLUTE_PATH_TO_OUTPUT_FILE>
 
-OUTPUT MODEL — TWO DISJOINT parts (read this before STEPS):
-
-The combined text (trailing_buffer + chunk_text) is split into TWO DISJOINT parts at the cut point:
-- WRITE-part: everything BEFORE the cut. Goes ONLY into the `tee -a` heredoc.
-- BUFFER-part: everything AFTER the cut. Goes ONLY between `===BUFFER===` markers.
-
-No word may appear in both parts. The trailing_buffer you RETURN must NOT appear at the end of what you WROTE. The BUFFER-part is text HELD BACK from this write so the next chunk can prepend it; it is NOT a copy of the tail you also send to the file. Writing the full combined text AND also returning its tail as buffer duplicates the boundary on every chunk and is the single most common silent bug in this skill.
-
-For the final chunk (`is_final: true`): WRITE-part is the entire combined text (with a terminal period if missing); BUFFER-part is empty.
-
-STEPS (steps 2–5 are done in your head — NO tool calls between Read and tee):
-1. [TOOL: Read] `Read(normalized_path, offset, limit)`. Strip the `cat -n` line-number prefix that Read adds (everything before the tab on each line). Join the lines with single spaces. This is your only Read.
-2. [MENTAL] Prepend the trailing_buffer (with a space separator if both are non-empty) to form the combined text.
-3. [MENTAL] Add `.` and `,` per the rules. Group into paragraphs.
-4. [MENTAL] Choose the cut point and split the combined text into the TWO DISJOINT parts:
-   - If `is_final` is false: pick the cut point yourself by reading the text — find the last sentence that ends on a clear terminal word and a complete thought. Everything BEFORE that point is the **WRITE-part**. Everything AFTER that point is the **BUFFER-part** (= the new trailing_buffer). If the text ends on a conjunction (`и`, `или`, `но`, `а`, `что`, `чтобы`, `that`, `because`, `so`), a preposition (`в`, `на`, `с`, `к`, `in`, `on`, `with`, `for`), an article (`the`, `a`, `an`), or any grammatically incomplete fragment, move more material from WRITE-part into BUFFER-part. When in doubt, save more to BUFFER-part. **Linguistic judgment — do not write a script, regex, or `rfind` lookup to find the cut.**
-   - If `is_final` is true: WRITE-part is the entire combined text (terminate the last sentence with a period if it lacks one); BUFFER-part is empty.
-5. [MENTAL] Verify the disjoint property: the WRITE-part and BUFFER-part share NO overlapping words. The last words of WRITE-part are NOT the same as BUFFER-part. If they overlap, you split wrong — re-do the cut so each word belongs to exactly one part.
-
-Example. Combined text: `"Первый тезис. Второй тезис. Третий не закон"`
-Cut after `"Второй тезис."`:
-- WRITE-part (goes into `tee -a`): `"Первый тезис. Второй тезис."`
-- BUFFER-part (goes into `===BUFFER===`): `"Третий не закон"`
-
-Output file gains `"Первый тезис. Второй тезис.\n"` — and NOTHING from `"Третий не закон"`. The next chunk's subagent will prepend `"Третий не закон"` to its own chunk_text and continue.
-
-6. [TOOL: Bash] **Self-check before issuing the `tee -a` call**: compare the last ~10 words of the WRITE-part (what you are about to write) against the BUFFER-part (what you will emit between `===BUFFER===` markers). They MUST be different — no shared trailing phrase. If they match, you are about to duplicate the boundary on the next chunk — go back to step 4 and fix the split before issuing the tool call.
-
-   Then append the WRITE-part to output_path with ONE Bash heredoc (use `tee -a`, NOT `cat >>` — `>>` triggers Claude Code's write-redirection check and prompts per chunk):
-   ```
-   tee -a "<output_path>" <<'OUT_EOF'
-   <WRITE-part as finished paragraphs, ONE paragraph per line, no blank lines between them>
-   OUT_EOF
-   ```
-   The heredoc body is **only the WRITE-part** — do NOT include the BUFFER-part here. No leading blank line. Each paragraph is one line; paragraphs are separated by a single `\n`. The heredoc's trailing newline cleanly separates this chunk's last paragraph from the next chunk's first paragraph (still single-newline). `tee -a` echoes content to stdout — harmless, just appears in the tool result. This is your only Bash call.
-7. End your response with EXACTLY these three lines (and nothing else after). The buffer string is the **BUFFER-part** from step 4 — nothing else:
-   ```
-   ===BUFFER===
-   <BUFFER-part, or blank line if is_final was true>
-   ===END===
-   ```
-
-SUBAGENT RED FLAGS — if any of these thoughts arise, STOP and just do the mental work in your response:
-- "Let me write a quick Python script to find the cutoff phrase" → No. Pick the cut by reading the text.
-- "I'll `cat > /tmp/format.py` to handle this cleanly" → No. No scratch files. Ever.
-- "Let me run `sed` / `awk` to clean this up" → No. Punctuation is added in your head, written via `tee -a`.
-- "I'll do a `Read` again to double-check the chunk" → No. One Read per chunk.
-- "Let me `wc -w` to verify the buffer is right size" → No. Trust your judgment; main agent verifies at the end.
-- "I'll split this into two `tee -a` calls so each paragraph is separate" → No. One heredoc with all paragraphs.
-- "`cat <<'EOF' | tee -a "..."` is the same thing, more idiomatic" → No. The first word of your Bash command must be `tee`. The pipeline form fails the static permission check and prompts the user per chunk, breaking the unattended run.
-- "I'll use `>>` redirection, it's simpler than `tee -a`" → No. `>>` is treated as a write operation by Claude Code's permission system and prompts the user per chunk. Use `tee -a` and only `tee -a`.
-- "I'll write the full combined text to the file AND return its tail as buffer, just to be safe" → No. WRITE-part and BUFFER-part are DISJOINT. The buffer is text HELD BACK from this write, not echoed alongside it. Writing both duplicates the boundary on every chunk — a silent bug that compounds across N chunks.
-
-If you find yourself reaching for any forbidden tool: that is the violation this prompt exists to prevent. The Iron Law of this skill is that processing happens in your head; tools only ferry text in (Read) and out (tee -a).
+Exactly three tool calls total: (1) Read of chunk-prompt.md, (2) Read of the chunk slice, (3) one Bash whose first word is `tee` to append the WRITE-part to output_path. End your response with the ===BUFFER=== / ===END=== marker block per the rules file.
 ```
+
+That is the entire dispatch prompt. Do not paste the rules from `chunk-prompt.md` into it — defeats the whole point.
 
 ### 5. Collect the buffer between chunks
 
@@ -304,7 +208,8 @@ Do **not** insert a heading or a blank line between paragraphs. One paragraph pe
 | Subagent deleted filler («э-э», «ну», "um") | Re-dispatch the chunk; filler is part of the speaker's text. |
 | Subagent wrote the full combined text to file AND returned its tail as buffer (boundary duplication) | Re-dispatch with the "TWO DISJOINT parts" framing emphasized: WRITE-part and BUFFER-part are disjoint; the trailing_buffer is held back from this write, not echoed alongside it. |
 | Subagent wrote a helper script (`cat > /tmp/*.py`, `python -c`, `sed`, `awk`, etc.) to "find the cutoff" or "process the text" | Hard violation of the subagent tool whitelist. Re-dispatch with the ALLOWED TOOLS / FORBIDDEN ACTIONS blocks emphasized. Steps 2–5 are mental — no shell, no Python. |
-| Subagent made >1 Read or >1 Bash call per chunk | Re-dispatch. Exactly one Read (load chunk) and one Bash (`tee -a` heredoc). Anything else is drift. |
+| Subagent made >2 Reads or >1 Bash call per chunk | Re-dispatch. Exactly two Reads (chunk-prompt.md + chunk slice) and one Bash (`tee -a` heredoc). Anything else is drift. |
+| Main agent inlined the full subagent rules in the dispatch prompt | Defeats the whole reason `chunk-prompt.md` exists — each dispatch then carries ~2k tokens of rules into main-agent context, ballooning past 10 chunks. Re-dispatch with the thin wrapper that just points the subagent to `chunk-prompt.md`. |
 | Subagent used `Write` / `Edit` / created temp files | Re-dispatch. The only file write is the single `tee -a` to `output_path`. |
 | Subagent used `cat <<'EOF' \| tee -a ...` (heredoc piped through `cat` into `tee`) — triggers per-chunk permission prompt | Permission analyzer matches `Bash(tee:*)` only when the command's first word is `tee`. Re-dispatch with the CORRECT vs WRONG block emphasized: heredoc must be the DIRECT stdin of `tee -a`, no `cat` prefix, no pipe. |
 | Subagent used `>>` redirection (`cat <<'EOF' >> "<path>"`) | Same root cause — redirection isn't allowed by the `Bash(tee:*)` rule and prompts per chunk. Re-dispatch using direct `tee -a "<path>" <<'OUT_EOF' ... OUT_EOF`. |
@@ -334,7 +239,8 @@ Do **not** insert a heading or a blank line between paragraphs. One paragraph pe
 | Total lines | `wc -l <source-stem>.normalized.txt` |
 | Number of chunks | `N = ceil(total_lines / 40)` |
 | Default output path | `<source-stem>.article.md` next to source |
-| Dispatch chunk i | `Agent(subagent_type="general-purpose", model="haiku", prompt=<filled subagent prompt with offset=1+40*(i-1), limit=40, trailing_buffer=<prev_buffer>, is_final=(i==N), output_path=...>)` |
+| Resolve chunk-prompt.md path | `find . -path '*/formatting-transcript/chunk-prompt.md' -print -quit \| xargs -r realpath` — run once before step 4, cache the absolute path |
+| Dispatch chunk i | `Agent(subagent_type="general-purpose", model="haiku", prompt=<thin wrapper: pointer to chunk-prompt.md absolute path + variables offset=1+40*(i-1), limit=40, trailing_buffer=<prev_buffer>, is_final=(i==N), output_path=...>)` |
 | Extract buffer from response | regex `===BUFFER===\n(.*?)\n===END===` (DOTALL) |
 | Verify preservation | `wc -w` source vs output, expect ±2% |
 | Clean up | `rm <source-stem>.normalized.txt` after verification passes |
