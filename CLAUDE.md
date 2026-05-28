@@ -4,16 +4,33 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Push-to-talk voice input for KDE Wayland. Two cooperating processes on the same host:
+A monorepo for Whisper-based audio tooling. Top-level layout:
 
-- **`server.py`** — long-running WhisperX HTTP service inside a rootless Podman container with NVIDIA GPU passthrough. Exposes `POST /transcribe` (ASR only, hot path for voice-input), `POST /diarize` (ASR + word-align + speaker diarization), `GET /health`.
+```
+whisper-for-input/        ← ASR backend (server + container); name matches the repo
+voice-input/              ← push-to-talk client daemon (consumer of /transcribe)
+cli/                      ← shell consumers: transcribe.sh, diarize.sh
+formatting-transcript/    ← Claude skill that turns raw transcripts into readable articles
+docs/, tasks/             ← Claude-tooling artifacts and task specs
+install.sh, CLAUDE.md     ← repo-root setup + this file
+```
+
+The backend plus its consumers (voice-input, cli, formatting-transcript) live side by side.
+
+Push-to-talk voice input for KDE Wayland is the primary use case. Two cooperating processes on the same host:
+
+- **`whisper-for-input/server.py`** — long-running WhisperX HTTP service inside a rootless Podman container with NVIDIA GPU passthrough. Exposes `POST /transcribe` (ASR only, hot path for voice-input), `POST /diarize` (ASR + word-align + speaker diarization), `GET /health`.
 - **`voice-input/voice-input.py`** — user-space daemon that reads `/dev/input/event*` via `evdev`, records with `arecord` while the hotkey (default `KEY_SCROLLLOCK`) is held, POSTs the WAV to the server, pastes the result via `wl-copy` + `xdotool key shift+Insert`. The matching systemd unit lives at `voice-input/voice-input.service`.
 
 The split exists because Whisper model load is multi-second; the resident server avoids paying it per utterance.
 
+**Other consumers:**
+- **`cli/transcribe.sh`, `cli/diarize.sh`** — thin curl wrappers around the server's `/transcribe` and `/diarize` endpoints for ad-hoc file transcription from the shell.
+- **`formatting-transcript/`** — a Claude skill (`SKILL.md` + `format_transcript.py`) that post-processes a raw transcript into a punctuated, paragraphed article. Imported from the former `audio-tools` repo via merge; its fixtures live in `formatting-transcript/tests/`.
+
 ## Architecture notes that span files
 
-**Models live outside the repo on the host** at `~/.local/share/whisper-for-input/models/` (HF cache, read-only mount) and `.../torch-cache/` (writable). The container runs with `HF_HUB_OFFLINE=1`, so anything not pre-fetched by `download-models.sh` will fail at runtime, not silently download. Three places reference these paths and **must stay in sync**: `whisper-for-input.container` (`Volume=`), `docker-compose.yml` (`volumes:`), `download-models.sh` (`DATA_DIR`).
+**Models live outside the repo on the host** at `~/.local/share/whisper-for-input/models/` (HF cache, read-only mount) and `.../torch-cache/` (writable). The container runs with `HF_HUB_OFFLINE=1`, so anything not pre-fetched by `download-models.sh` will fail at runtime, not silently download. Three places (all under `whisper-for-input/`) reference these paths and **must stay in sync**: `whisper-for-input.container` (`Volume=`), `docker-compose.yml` (`volumes:`), `download-models.sh` (`DATA_DIR`).
 
 **Two model fetch paths, intentionally:**
 - `download-models.sh` (host, needs `./secrets/hf_token`) pulls the faster-whisper CTranslate2 weights, pyannote diarization (3.1 + community-1) + segmentation + wespeaker, and the Russian wav2vec2 alignment model into the HF cache. The community-1 repo is needed even though `server.py` selects 3.1 — pyannote.audio 4.x's 3.1 pipeline lazily loads `xvec_transform.npz` from community-1 as its PLDA component, and under `HF_HUB_OFFLINE=1` that fails on cache miss.
@@ -31,9 +48,11 @@ The split exists because Whisper model load is multi-second; the resident server
 
 ## Common commands
 
+Server-stack commands (build, models, compose) run from inside `whisper-for-input/`; `install.sh` and the voice-input client run from the repo root.
+
 ```bash
-# Initial setup (once per host)
-./download-models.sh                                  # needs ./secrets/hf_token
+# Initial setup (once per host) — from repo root
+(cd whisper-for-input && ./download-models.sh)        # needs whisper-for-input/secrets/hf_token
 ./install.sh                                          # builds image, installs systemd units
 sudo usermod -a -G input $USER                        # then re-login
 
@@ -43,15 +62,17 @@ systemctl --user enable --now voice-input             # client
 journalctl --user -fu whisper-for-input               # live server logs
 journalctl --user -fu voice-input                     # live client logs
 
-# Run via docker-compose (alternative)
+# Run via docker-compose (alternative) — from whisper-for-input/
+cd whisper-for-input
 docker compose up -d
 docker compose logs -f
 
-# Rebuild image after server.py or Dockerfile changes
+# Rebuild image after server.py or Dockerfile changes — from whisper-for-input/
+cd whisper-for-input
 podman build -t whisper-for-input:latest .
 systemctl --user restart whisper-for-input
 
-# Run voice-input directly for debugging (bypasses systemd)
+# Run voice-input directly for debugging (bypasses systemd) — from repo root
 python3 voice-input/voice-input.py --key KEY_SCROLLLOCK --lang ru --url http://localhost:8000
 python3 voice-input/voice-input.py --list-keys        # list available evdev key names
 
@@ -63,9 +84,11 @@ curl http://localhost:8000/health
 
 ## Локальная дев-среда и тесты
 
-Чтобы итерироваться над `server.py` без пересборки контейнерного образа, есть локальный venv с тем же стеком, что внутри контейнера (Python 3.12 + cu128 wheels).
+Чтобы итерироваться над `server.py` без пересборки контейнерного образа, есть локальный venv с тем же стеком, что внутри контейнера (Python 3.12 + cu128 wheels). Это **venv только бэкенда** — он живёт в `whisper-for-input/.venv`, и всё ниже выполняется **из `whisper-for-input/`** (`cd whisper-for-input` сначала): там `server.py`, `requirements*.txt`, `pytest.ini` и `tests/`. Остальным частям монорепо этот стек не нужен: `cli/` — чистый shell, `formatting-transcript/` — stdlib-only Python (зовёт `claude -p`), `voice-input/` — лёгкие `evdev`+`requests` под системным `python3`.
 
 ```bash
+cd whisper-for-input
+
 # Один раз: поднять venv с зависимостями (~5 мин, ~5 GB)
 python3.12 -m venv .venv
 .venv/bin/pip install -r requirements.txt -r requirements-dev.txt \
