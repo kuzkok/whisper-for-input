@@ -8,7 +8,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # ── Quadlet container unit ────────────────────────────────────────────────────
 QUADLET_DIR="$HOME/.config/containers/systemd"
 mkdir -p "$QUADLET_DIR"
-cp "$SCRIPT_DIR/whisper-for-input.container" "$QUADLET_DIR/"
+cp "$SCRIPT_DIR/whisper-for-input/whisper-for-input.container" "$QUADLET_DIR/"
 echo "Installed: $QUADLET_DIR/whisper-for-input.container"
 
 # ── voice-input script → ~/.local/bin ────────────────────────────────────────
@@ -48,10 +48,10 @@ fi
 # ── Build the image if not present ───────────────────────────────────────────
 if ! podman image exists localhost/whisper-for-input:latest; then
     echo "Building whisper-for-input image (this will take a few minutes)..."
-    podman build -t whisper-for-input:latest "$SCRIPT_DIR"
+    podman build -t whisper-for-input:latest "$SCRIPT_DIR/whisper-for-input"
 else
     echo "Image localhost/whisper-for-input:latest already exists, skipping build."
-    echo "To rebuild: podman build -t whisper-for-input:latest $SCRIPT_DIR"
+    echo "To rebuild: podman build -t whisper-for-input:latest $SCRIPT_DIR/whisper-for-input"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────
@@ -60,7 +60,7 @@ cat <<'EOF'
 Done. Next steps:
 
   # First-time setup (once):
-  ./download-models.sh                  # populates ~/.local/share/whisper-for-input/models/ (~6-7 GB)
+  ./whisper-for-input/download-models.sh   # populates ~/.local/share/whisper-for-input/models/ (~6-7 GB)
 
   # Start (and enable on login):
   systemctl --user enable --now whisper-for-input
