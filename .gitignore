@@ -4,4 +4,4 @@ __pycache__/
 .venv/
 .pytest_cache/
 .*.kate-swp
-tests/*.article.md
+formatting-transcript/tests/*.article.md
