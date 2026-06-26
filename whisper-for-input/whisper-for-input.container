@@ -13,9 +13,9 @@ After=network.target
 [Container]
 Image=localhost/whisper-for-input:latest
 PublishPort=127.0.0.1:8000:8000
-# Map the calling host user (kuzkok) to the in-container `whisper` user
-# (UID/GID 5000). The mounted models/ and torch-cache/ dirs (owned by host
-# kuzkok) then appear to `whisper` as its own files — no chown required.
+# Map the calling host user to the in-container `whisper` user
+# (UID/GID 5000). The mounted models/ and torch-cache/ dirs (owned by the
+# host user) then appear to `whisper` as its own files — no chown required.
 UserNS=keep-id:uid=5000,gid=5000
 Volume=%h/.local/share/whisper-for-input/models:/home/whisper/.cache/huggingface:z,ro
 # WhisperX downloads its VAD model (~17MB) and torchaudio English alignment

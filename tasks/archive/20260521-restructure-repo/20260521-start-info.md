@@ -89,7 +89,7 @@ whisper-for-input/                    ← git root (репо, github remote)
 ### ✅ 1. `git subtree merge` для audio-tools
 
 ```bash
-git remote add audio-tools-local /home/kuzkok/Data/whisper/audio-tools
+git remote add audio-tools-local /path/to/audio-tools
 git fetch audio-tools-local
 git merge --allow-unrelated-histories audio-tools-local/master \
     -m "Импорт audio-tools (formatting-transcript) в монорепо"
