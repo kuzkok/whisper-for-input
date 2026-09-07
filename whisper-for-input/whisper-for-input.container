@@ -11,7 +11,10 @@ Description=WhisperX ASR + diarization service
 After=network.target
 
 [Container]
-Image=localhost/whisper-for-input:latest
+# Тег запинен намеренно: рестарт юнита не должен подхватывать случайно
+# пересобранный :latest. Значение держится в одном виде с docker-compose.yml,
+# бампится вручную при пересборке.
+Image=localhost/whisper-for-input:20260907.2
 PublishPort=127.0.0.1:8000:8000
 # Map the calling host user to the in-container `whisper` user
 # (UID/GID 5000). The mounted models/ and torch-cache/ dirs (owned by the
@@ -25,7 +28,11 @@ Volume=%h/.local/share/whisper-for-input/torch-cache:/home/whisper/.cache/torch:
 Environment=WHISPER_MODEL=dropbox-dash/faster-whisper-large-v3-turbo
 Environment=WHISPER_DEVICE=cuda
 Environment=WHISPER_COMPUTE_TYPE=int8_float16
-Environment=WHISPER_BATCH_SIZE=16
+# Подобран замером на RTX 3060 6 ГБ: батч добавляет ~230 МБ VRAM на единицу,
+# а ускоряет только ASR-фазу, которая в /diarize занимает считанные секунды из
+# минут. 16 упирается в потолок карты и падает с CUDA out of memory, как только
+# десктоп займёт свою часть VRAM. Подробности в CLAUDE.md.
+Environment=WHISPER_BATCH_SIZE=8
 Environment=HF_HOME=/home/whisper/.cache/huggingface
 # Models are pre-downloaded by ./download-models.sh on the host. No network or
 # token needed at runtime — fail fast on cache misses instead of silently fetching.

@@ -40,6 +40,12 @@ The split exists because Whisper model load is multi-second; the resident server
 
 **CUDA libs come from pip, not the base image.** `Dockerfile` installs `torch==2.8.0+cu128` from the PyTorch cu128 index; CUDA runtime ships as `nvidia-*` wheels into `site-packages/nvidia/*`. `LD_LIBRARY_PATH` is set to the NPP lib dir explicitly because torch's auto-dlopen path doesn't cover NPP. `libcuda.so.1` (driver) is injected at runtime by `AddDevice=nvidia.com/gpu=all` (Quadlet) or the `deploy.resources` block (Compose). The `torch==2.8.0` pin is forced by `whisperx → pyannote.audio 4.x → torchcodec 0.7` ABI requirements — don't bump torch in isolation.
 
+**nltk punkt_tab ships inside the image, unlike the models.** `whisperx.align()` splits text into sentences with nltk and, on a cache miss, calls `nltk.download()`, a blocking HTTP fetch with no timeout that hangs `/diarize` forever in the offline container. `HF_HUB_OFFLINE` does not cover it; nltk has its own downloader. The `Dockerfile` pre-fetches `punkt_tab` into `NLTK_DATA=/home/whisper/nltk_data` (~11MB of static tables, not a model: no token, no lifecycle), and `server.py:_disable_nltk_download()` replaces `nltk.download` at startup so a miss fails loudly instead of hanging. `GET /health` reports `punkt_available`.
+
+**`/transcribe` and `/diarize` are sync handlers on purpose.** Their bodies are blocking (GPU, ffmpeg); as `async def` a single long request froze the whole event loop, `/health` included. FastAPI runs `def` handlers in a threadpool, and `_gpu_lock` keeps the shared models single-request-at-a-time, the serialization the event loop used to provide for free.
+
+**`WHISPER_BATCH_SIZE=8` is a measured ceiling, not a guess.** On the 6GB RTX 3060 each unit of batch costs ~230MB of VRAM in the ASR phase (peak: 2590MB at 4, 3518MB at 8, 4446MB at 12, 5374MB at 16, OOM at 20). Speed barely moves: 10 minutes of audio transcribe in 8.5s at batch 4 vs 7.5s at batch 12, and a 6-second voice-input clip takes ~0.4s regardless. In `/diarize` the ASR phase is a few seconds out of minutes, and the real peak (~5.2GB, both at 10 and 34 minutes of input) comes from align + pyannote, not from the batch. So a bigger batch buys nothing measurable and eats the headroom the desktop shares: 16 works on an idle GPU and dies with `CUDA failed with error out of memory` as soon as a browser takes its slice.
+
 **Alignment model cache is per-language and lazy.** `server.py:_align_models` keys by language code; the Russian wav2vec2 is pre-downloaded, English is fetched on first English `/diarize`. Languages without pre-cached weights will fail in offline mode.
 
 **`PRELOAD_DIARIZE=1`** loads the pyannote pipeline at startup (adds ~5s + GPU memory). Off by default — diarization is the cold path. The transcribe model always loads at startup via the `lifespan` context manager.
@@ -68,9 +74,10 @@ docker compose up -d
 docker compose logs -f
 
 # Rebuild image after server.py or Dockerfile changes — from whisper-for-input/
+# Bump the tag in whisper-for-input.container + docker-compose.yml first, then:
 cd whisper-for-input
-podman build -t whisper-for-input:latest .
-systemctl --user restart whisper-for-input
+podman build -t whisper-for-input:20260907.2 -t whisper-for-input:latest .
+systemctl --user daemon-reload && systemctl --user restart whisper-for-input
 
 # Run voice-input directly for debugging (bypasses systemd) — from repo root
 python3 voice-input/voice-input.py --key KEY_SCROLLLOCK --lang ru --url http://localhost:8000
@@ -110,7 +117,7 @@ LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/nvidia/npp/lib" \
 .venv/bin/uvicorn server:app --reload  # ручная проверка с reload
 
 # Только когда `pytest -m gpu` зелёный — пересобирать образ
-podman build -t whisper-for-input:latest .
+podman build -t whisper-for-input:20260907.2 -t whisper-for-input:latest .
 systemctl --user restart whisper-for-input
 ```
 
@@ -118,7 +125,7 @@ Audio-фикстуры (`tests/fixtures/{ru_short,jfk}.wav`) хранятся ч
 
 ## Editing gotchas
 
-- **Bumping the image tag** in `docker-compose.yml` (`whisper-for-input:20260515.4`) is a manual versioning convention, not auto-generated. The Quadlet unit uses `:latest`; they don't have to match.
+- **Bumping the image tag** is a manual versioning convention, not auto-generated, and it lives in three places that must agree: `whisper-for-input.container` (`Image=`), `docker-compose.yml` (`image:`), and whatever you pass to `podman build -t`. The Quadlet unit is pinned on purpose so a restart never picks up an unrelated `:latest` rebuild; `install.sh` reads the tag back out of the unit. Build both tags (`-t whisper-for-input:<tag> -t whisper-for-input:latest`).
 - **`voice-input/voice-input.py` is copied to `~/.local/bin/voice-input` by `install.sh`** — editing the repo file alone won't affect the running service. Re-run `install.sh` or copy manually, then `systemctl --user restart voice-input`.
 - **`type_text()` uses `wl-copy` + `xdotool key shift+Insert`**, not `ydotool type`. This is intentional for Cyrillic — `ydotool type` mangles non-ASCII on most layouts. Don't "simplify" it back.
 - **Container is rootless Podman with `SecurityLabelDisable=true` / `label:disable`**. SELinux relabel (`:z`) on the model volume is needed; don't drop it.

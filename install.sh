@@ -46,12 +46,22 @@ if [[ -z "$(ls -A "$TORCH_CACHE_DIR" 2>/dev/null)" ]]; then
 fi
 
 # ── Build the image if not present ───────────────────────────────────────────
-if ! podman image exists localhost/whisper-for-input:latest; then
-    echo "Building whisper-for-input image (this will take a few minutes)..."
-    podman build -t whisper-for-input:latest "$SCRIPT_DIR/whisper-for-input"
+# Тег берётся из Quadlet-юнита: он запинен на конкретную версию, и собрать
+# только :latest недостаточно, юнит такой образ не найдёт.
+IMAGE_TAG="$(sed -n 's|^Image=localhost/whisper-for-input:||p' \
+    "$SCRIPT_DIR/whisper-for-input/whisper-for-input.container")"
+if [[ -z "$IMAGE_TAG" ]]; then
+    echo "ERROR: не удалось вычитать Image= из whisper-for-input.container" >&2
+    exit 1
+fi
+
+if ! podman image exists "localhost/whisper-for-input:$IMAGE_TAG"; then
+    echo "Building whisper-for-input image $IMAGE_TAG (this will take a few minutes)..."
+    podman build -t "whisper-for-input:$IMAGE_TAG" -t whisper-for-input:latest \
+        "$SCRIPT_DIR/whisper-for-input"
 else
-    echo "Image localhost/whisper-for-input:latest already exists, skipping build."
-    echo "To rebuild: podman build -t whisper-for-input:latest $SCRIPT_DIR/whisper-for-input"
+    echo "Image localhost/whisper-for-input:$IMAGE_TAG already exists, skipping build."
+    echo "To rebuild: podman build -t whisper-for-input:$IMAGE_TAG -t whisper-for-input:latest $SCRIPT_DIR/whisper-for-input"
 fi
 
 # ── Summary ───────────────────────────────────────────────────────────────────

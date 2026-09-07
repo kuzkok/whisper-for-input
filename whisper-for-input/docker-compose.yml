@@ -1,7 +1,7 @@
 services:
   whisper:
     build: .
-    image: whisper-for-input:20260515.4
+    image: whisper-for-input:20260907.2
     restart: unless-stopped
     ports:
       - "127.0.0.1:8000:8000"
@@ -15,7 +15,7 @@ services:
       - WHISPER_MODEL=dropbox-dash/faster-whisper-large-v3-turbo
       - WHISPER_DEVICE=cuda
       - WHISPER_COMPUTE_TYPE=int8_float16
-      - WHISPER_BATCH_SIZE=16
+      - WHISPER_BATCH_SIZE=8   # см. CLAUDE.md: 16 не влезает в 6 ГБ VRAM
       - HF_HOME=/home/whisper/.cache/huggingface
       - HF_HUB_OFFLINE=1
       - LD_LIBRARY_PATH=/opt/venv/lib/python3.12/site-packages/nvidia/npp/lib

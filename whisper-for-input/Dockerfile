@@ -43,6 +43,20 @@ RUN pip install \
         --extra-index-url https://download.pytorch.org/whl/cu128 \
         -r requirements.txt
 
+# nltk punkt_tab: таблицы для разбиения текста на предложения, которыми
+# пользуется whisperx.align(). Без них align() зовёт nltk.download(), а это
+# блокирующий HTTP без таймаута, и в офлайн-контейнере он вешает /diarize
+# навсегда. HF_HUB_OFFLINE на загрузчик nltk не распространяется, у него
+# собственный механизм.
+#
+# Данные лежат в образе, а не в volume рядом с весами: это не модель, а
+# статический ресурс библиотеки (~11 МБ, не менялся с выхода nltk 3.9),
+# привязанный к версии nltk/whisperx из requirements.txt. Токен и лицензия,
+# из-за которых модели держатся снаружи, тут не нужны.
+ENV NLTK_DATA=/home/whisper/nltk_data
+RUN python -m nltk.downloader -d "$NLTK_DATA" punkt_tab && \
+        rm -f "$NLTK_DATA/tokenizers/punkt_tab.zip"
+
 COPY --chown=whisper:whisper server.py .
 
 EXPOSE 8000
