@@ -234,7 +234,11 @@ def test_diarize_text_groups_consecutive_same_speaker(patched_server):
     assert resp.status_code == 200
     body = resp.json()
     assert body["language"] == "ru"
-    expected = "[SPEAKER_00] привет мир\n\n[SPEAKER_01] ответ\n\n[SPEAKER_00] снова"
+    expected = (
+        "[00:00:00] [SPEAKER_00] привет мир\n\n"
+        "[00:00:01] [SPEAKER_01] ответ\n\n"
+        "[00:00:02] [SPEAKER_00] снова"
+    )
     assert body["text"] == expected
 
 
@@ -255,7 +259,27 @@ def test_diarize_text_single_speaker(monkeypatch, patched_server):
         data={"language": "ru", "format": "text"},
     )
     assert resp.status_code == 200
-    assert resp.json()["text"] == "[SPEAKER_00] один блок"
+    assert resp.json()["text"] == "[00:00:00] [SPEAKER_00] один блок"
+
+
+def test_diarize_text_timestamp_hours(monkeypatch, patched_server):
+    """3725.15s → 01:02:05: метка HH:MM:SS с округлением вниз до целой секунды."""
+    monkeypatch.setattr(
+        patched_server.module.whisperx,
+        "assign_word_speakers",
+        lambda d, t: {
+            "segments": [
+                {"start": 3725.15, "end": 3730.0, "speaker": "SPEAKER_01", "text": "долго"},
+            ]
+        },
+    )
+    resp = patched_server.client.post(
+        "/diarize",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={"language": "ru", "format": "text"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["text"] == "[01:02:05] [SPEAKER_01] долго"
 
 
 # ── /diarize: проброс min/max_speakers ─────────────────────────────────────

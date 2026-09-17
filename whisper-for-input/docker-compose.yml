@@ -1,7 +1,7 @@
 services:
   whisper:
     build: .
-    image: whisper-for-input:20260907.2
+    image: whisper-for-input:20260917.1
     restart: unless-stopped
     ports:
       - "127.0.0.1:8000:8000"

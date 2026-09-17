@@ -141,6 +141,13 @@ def _normalize_language(language: str):
     return lang
 
 
+def _format_ts(seconds: float) -> str:
+    """Секунды с начала записи → HH:MM:SS, округление вниз до целой секунды."""
+    h, rem = divmod(int(seconds), 3600)
+    m, s = divmod(rem, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
+
+
 def _set_initial_prompt(prompt):
     """Per-request мутация _model.options.initial_prompt.
 
@@ -194,7 +201,8 @@ def diarize(
     """Full WhisperX pipeline: ASR + word alignment + speaker diarization.
 
     format=json  → {"language": "...", "segments": [{start, end, speaker, text}, ...]}
-    format=text  → {"language": "...", "text": "[SPEAKER_00] ...\\n\\n[SPEAKER_01] ..."}
+    format=text  → {"language": "...",
+                     "text": "[00:01:23] [SPEAKER_00] ...\n\n[00:05:41] [SPEAKER_01] ..."}
 
     INITIAL_PROMPT здесь НЕ используется: эндпоинт обслуживает произвольные
     встречи/видео, и русская подсказка про разработчика загнала бы английскую
@@ -247,17 +255,19 @@ def diarize(
     if format == "text":
         lines = []
         current_speaker = None
+        current_start = 0.0
         current_text = []
         for s in segments:
             if s["speaker"] != current_speaker:
                 if current_text:
-                    lines.append(f"[{current_speaker}] {' '.join(current_text)}")
+                    lines.append(f"[{_format_ts(current_start)}] [{current_speaker}] {' '.join(current_text)}")
                 current_speaker = s["speaker"]
+                current_start = s["start"]
                 current_text = [s["text"]]
             else:
                 current_text.append(s["text"])
         if current_text:
-            lines.append(f"[{current_speaker}] {' '.join(current_text)}")
+            lines.append(f"[{_format_ts(current_start)}] [{current_speaker}] {' '.join(current_text)}")
         return JSONResponse({"language": lang_code, "text": "\n\n".join(lines)})
 
     return JSONResponse({"language": lang_code, "segments": segments})
