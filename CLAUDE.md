@@ -76,7 +76,7 @@ docker compose logs -f
 # Rebuild image after server.py or Dockerfile changes — from whisper-for-input/
 # Bump the tag in whisper-for-input.container + docker-compose.yml first, then:
 cd whisper-for-input
-podman build -t whisper-for-input:20260907.2 -t whisper-for-input:latest .
+podman build -t whisper-for-input:20260917.1 -t whisper-for-input:latest .
 systemctl --user daemon-reload && systemctl --user restart whisper-for-input
 
 # Run voice-input directly for debugging (bypasses systemd) — from repo root
@@ -91,37 +91,37 @@ curl http://localhost:8000/health
 
 ## Локальная дев-среда и тесты
 
-Чтобы итерироваться над `server.py` без пересборки контейнерного образа, есть локальный venv с тем же стеком, что внутри контейнера (Python 3.12 + cu128 wheels). Это **venv только бэкенда** — он живёт в `whisper-for-input/.venv`, и всё ниже выполняется **из `whisper-for-input/`** (`cd whisper-for-input` сначала): там `server.py`, `requirements*.txt`, `pytest.ini` и `tests/`. Остальным частям монорепо этот стек не нужен: `cli/` — чистый shell, `formatting-transcript/` — stdlib-only Python (зовёт `claude -p`), `voice-input/` — лёгкие `evdev`+`requests` под системным `python3`.
+Чтобы итерироваться над `server.py` без пересборки контейнерного образа, есть локальный venv с тем же стеком, что внутри контейнера (Python 3.12 + cu128 wheels). Это **venv только бэкенда** — он живёт в корне репо (`.venv/`), а дев-цикл ниже выполняется **из `whisper-for-input/`** (`cd whisper-for-input`): там `server.py`, `requirements*.txt`, `pytest.ini` и `tests/`, поэтому venv в командах адресуется как `../.venv`. Остальным частям монорепо этот стек не нужен: `cli/` — чистый shell, `formatting-transcript/` — stdlib-only Python (зовёт `claude -p`), `voice-input/` — лёгкие `evdev`+`requests` под системным `python3`.
 
 ```bash
-cd whisper-for-input
-
-# Один раз: поднять venv с зависимостями (~5 мин, ~5 GB)
+# Один раз, из корня репо: поднять venv с зависимостями (~5 мин, ~5 GB)
 python3.12 -m venv .venv
-.venv/bin/pip install -r requirements.txt -r requirements-dev.txt \
+.venv/bin/pip install -r whisper-for-input/requirements.txt \
+    -r whisper-for-input/requirements-dev.txt \
     --extra-index-url https://download.pytorch.org/whl/cu128
 
 # Если только что склонировал репо — подтянуть LFS-фикстуры:
 git lfs pull
 
-# Дев-цикл
-.venv/bin/pytest -m smoke           # ~доли секунды, ловит API-дрифт whisperx
-.venv/bin/pytest -m unit            # ~секунды, логика обработчиков с моками
-.venv/bin/pytest                    # smoke + unit (gpu выключены addopts'ом)
+# Дев-цикл — из whisper-for-input/
+cd whisper-for-input
+../.venv/bin/pytest -m smoke           # ~доли секунды, ловит API-дрифт whisperx
+../.venv/bin/pytest -m unit            # ~секунды, логика обработчиков с моками
+../.venv/bin/pytest                    # smoke + unit (gpu выключены addopts'ом)
 # GPU integration — нужны те же env vars, что у systemd unit/контейнера:
-LD_LIBRARY_PATH="$PWD/.venv/lib/python3.12/site-packages/nvidia/npp/lib" \
+LD_LIBRARY_PATH="$PWD/../.venv/lib/python3.12/site-packages/nvidia/npp/lib" \
     HF_HOME="$HOME/.local/share/whisper-for-input/models" \
     HF_HUB_OFFLINE=1 \
     WHISPER_MODEL=dropbox-dash/faster-whisper-large-v3-turbo \
-    .venv/bin/pytest -m gpu          # реальные модели + GPU, ~минута на холодную
-.venv/bin/uvicorn server:app --reload  # ручная проверка с reload
+    ../.venv/bin/pytest -m gpu          # реальные модели + GPU, ~минута на холодную
+../.venv/bin/uvicorn server:app --reload  # ручная проверка с reload
 
 # Только когда `pytest -m gpu` зелёный — пересобирать образ
-podman build -t whisper-for-input:20260907.2 -t whisper-for-input:latest .
+podman build -t whisper-for-input:20260917.1 -t whisper-for-input:latest .
 systemctl --user restart whisper-for-input
 ```
 
-Audio-фикстуры (`tests/fixtures/{ru_short,jfk}.wav`) хранятся через git-lfs. Sidecar JSON рядом с каждым WAV содержит транскрипт, source URL и лицензию. Менять фикстуры — обычным `git add` после ручной замены файла.
+Audio-фикстуры (`tests/fixtures/{ru_short.ogx,jfk.wav}`) хранятся через git-lfs. Sidecar JSON рядом с каждым аудиофайлом содержит транскрипт, source URL и лицензию. Менять фикстуры — обычным `git add` после ручной замены файла.
 
 ## Editing gotchas
 
