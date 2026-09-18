@@ -11,6 +11,7 @@ whisper-for-input/        ← ASR backend (server + container); name matches the
 voice-input/              ← push-to-talk client daemon (consumer of /transcribe)
 cli/                      ← shell consumers: transcribe.sh, diarize.sh
 formatting-transcript/    ← Claude skill that turns raw transcripts into readable articles
+transcript-cleanup/       ← Claude skill that cleans diarized transcripts (names, glossary, punctuation)
 docs/, tasks/             ← Claude-tooling artifacts and task specs
 install.sh, CLAUDE.md     ← repo-root setup + this file
 ```
@@ -27,6 +28,7 @@ The split exists because Whisper model load is multi-second; the resident server
 **Other consumers:**
 - **`cli/transcribe.sh`, `cli/diarize.sh`** — thin curl wrappers around the server's `/transcribe` and `/diarize` endpoints for ad-hoc file transcription from the shell.
 - **`formatting-transcript/`** — a Claude skill (`SKILL.md` + `format_transcript.py`) that post-processes a raw transcript into a punctuated, paragraphed article. Imported from the former `audio-tools` repo via merge; its fixtures live in `formatting-transcript/tests/`.
+- **`transcript-cleanup/`** — a Claude skill (`SKILL.md` + `cleanup_transcript.py`) that cleans diarized meeting transcripts (output of `cli/diarize.sh`): maps `SPEAKER_XX` labels to real names via a project context file (two-phase: sonnet builds the speaker map from a meeting skeleton, substitution is deterministic, haiku cleans text per ~40-replica chunks; the `[HH:MM:SS] [Speaker]` skeleton never passes through the model). Unlike formatting-transcript, it fixes ASR word errors per the context-file glossary — the two skills' edit policies are deliberately incompatible. Tests with a fake `claude -p` live in `transcript-cleanup/tests/` (stdlib `unittest`, no repo venv needed). `install.sh` symlinks the skill folder into `~/.claude/skills/transcript-cleanup`.
 
 ## Architecture notes that span files
 

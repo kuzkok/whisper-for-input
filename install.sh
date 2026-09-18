@@ -24,6 +24,14 @@ mkdir -p "$SERVICE_DIR"
 cp "$SCRIPT_DIR/voice-input/voice-input.service" "$SERVICE_DIR/"
 echo "Installed: $SERVICE_DIR/voice-input.service"
 
+# ── transcript-cleanup skill symlink ──────────────────────────────────────────
+# Симлинк на папку в репо: репо остаётся источником правды, правки скилла
+# подхватываются без переустановки.
+SKILLS_DIR="$HOME/.claude/skills"
+mkdir -p "$SKILLS_DIR"
+ln -sfn "$SCRIPT_DIR/transcript-cleanup" "$SKILLS_DIR/transcript-cleanup"
+echo "Linked: $SKILLS_DIR/transcript-cleanup -> $SCRIPT_DIR/transcript-cleanup"
+
 # ── Reload daemon ─────────────────────────────────────────────────────────────
 systemctl --user daemon-reload
 echo "Daemon reloaded."
