@@ -103,12 +103,22 @@ python3.12 -m venv .venv
 # Если только что склонировал репо — подтянуть LFS-фикстуры:
 git lfs pull
 
+# nltk punkt_tab для pytest -m gpu (его требует whisperx.align): в контейнерном
+# образе он предзалит Dockerfile'ом, а в хостовом venv его нет — без него gpu-тесты
+# падают LookupError'ом. Кладём внутрь venv: nltk ищет sys.prefix/nltk_data
+# автоматически, env vars не нужны. -d обязателен — без него downloader кладёт
+# в ~/nltk_data и засоряет home:
+.venv/bin/python -m nltk.downloader -d .venv/nltk_data punkt_tab
+
 # Дев-цикл — из whisper-for-input/
 cd whisper-for-input
 ../.venv/bin/pytest -m smoke           # ~доли секунды, ловит API-дрифт whisperx
 ../.venv/bin/pytest -m unit            # ~секунды, логика обработчиков с моками
 ../.venv/bin/pytest                    # smoke + unit (gpu выключены addopts'ом)
-# GPU integration — нужны те же env vars, что у systemd unit/контейнера:
+# GPU integration — нужны те же env vars, что у systemd unit/контейнера,
+# и остановленный сервис whisper-for-input: резидентные веса в контейнере
+# не оставляют места на 6-ГБ карте — тесты падают с CUDA OOM ещё на загрузке
+# модели (systemctl --user stop whisper-for-input, после прогона start):
 LD_LIBRARY_PATH="$PWD/../.venv/lib/python3.12/site-packages/nvidia/npp/lib" \
     HF_HOME="$HOME/.local/share/whisper-for-input/models" \
     HF_HUB_OFFLINE=1 \
