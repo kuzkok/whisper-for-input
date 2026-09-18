@@ -148,17 +148,23 @@ def _format_ts(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
-def _set_initial_prompt(prompt):
-    """Per-request мутация _model.options.initial_prompt.
+def _set_asr_hints(initial_prompt, hotwords):
+    """Per-request мутация ASR-подсказок в _model.options.
 
-    whisperx 3.8.5 не позволяет передать initial_prompt в model.transcribe(...) —
-    он зашит в asr_options на этапе load_model. Чтобы /transcribe и /diarize
-    использовали разные промпты (диктовка vs произвольная встреча), мутируем
-    options перед каждым вызовом. faster_whisper.TranscriptionOptions — это
-    dataclass; whisperx сам пользуется dataclasses.replace по тому же паттерну
-    (см. .venv/.../whisperx/asr.py:262).
+    whisperx 3.8.5 не позволяет передать initial_prompt/hotwords в
+    model.transcribe(...) — они зашиты в asr_options на этапе load_model.
+    Чтобы эндпоинты (и отдельные запросы /diarize) использовали разные
+    подсказки, мутируем options перед каждым вызовом. faster_whisper.
+    TranscriptionOptions — это dataclass; whisperx сам пользуется
+    dataclasses.replace по тому же паттерну (см. .venv/.../whisperx/asr.py:262).
+
+    Оба поля нужно передавать всегда, а не только «которые меняются»:
+    options живут в глобальной модели, забытое значение утечёт в следующий
+    запрос (например, hotwords из /diarize — в диктовку voice-input).
     """
-    _model.options = dataclasses.replace(_model.options, initial_prompt=prompt)
+    _model.options = dataclasses.replace(
+        _model.options, initial_prompt=initial_prompt, hotwords=hotwords
+    )
 
 
 @app.post("/transcribe")
@@ -182,7 +188,7 @@ def transcribe(
     try:
         with _gpu_lock:
             audio = whisperx.load_audio(tmp_path)
-            _set_initial_prompt(INITIAL_PROMPT or None)
+            _set_asr_hints(INITIAL_PROMPT or None, None)
             result = _model.transcribe(audio, batch_size=BATCH_SIZE, language=lang)
         text = " ".join(seg["text"].strip() for seg in result["segments"]).strip()
     finally:
@@ -197,6 +203,8 @@ def diarize(
     min_speakers: int = Form(0),
     max_speakers: int = Form(0),
     format: str = Form("json"),
+    initial_prompt: str = Form(""),
+    hotwords: str = Form(""),
 ):
     """Full WhisperX pipeline: ASR + word alignment + speaker diarization.
 
@@ -204,9 +212,25 @@ def diarize(
     format=text  → {"language": "...",
                      "text": "[00:01:23] [SPEAKER_00] ...\n\n[00:05:41] [SPEAKER_01] ..."}
 
-    INITIAL_PROMPT здесь НЕ используется: эндпоинт обслуживает произвольные
-    встречи/видео, и русская подсказка про разработчика загнала бы английскую
-    речь в перевод (Whisper интерпретирует prompt как контекст языка).
+    Глобальный INITIAL_PROMPT здесь НЕ используется: эндпоинт обслуживает
+    произвольные встречи/видео, и русская подсказка про разработчика загнала бы
+    английскую речь в перевод (Whisper интерпретирует prompt как контекст языка).
+
+    Вместо этого — опциональные per-request подсказки для аудио с известным
+    контекстом (термины проекта, имена, аббревиатуры); пустое значение →
+    текущее поведение без промпта. Действуют только на этап ASR: выравнивание
+    и pyannote их не видят.
+
+    initial_prompt — контекстная фраза («Ретро-встреча команды X»). В batched
+    пайплайне whisperx подмешивается в контекст КАЖДОГО батча VAD-сегментов,
+    т.е. действует на всё аудио, а не только на начало. Задаёт и язык-контекст:
+    промпт не на языке аудио может увести распознавание в перевод.
+    hotwords — список ключевых слов через пробел; ставятся вплотную к
+    декодируемому окну, на редкие термины действует сильнее, чем initial_prompt.
+
+    Обе подсказки ограничены prompt-окном Whisper (~200+ токенов): это короткая
+    строка с ключевыми терминами, а не глоссарий целиком. Сервер не валидирует
+    длину; faster-whisper молча обрежет hotwords до половины окна.
 
     Как и /transcribe, объявлен sync: пайплайн блокирующий и минутами держит
     поток, а event loop должен оставаться отзывчивым.
@@ -217,7 +241,7 @@ def diarize(
     try:
         with _gpu_lock:
             audio = whisperx.load_audio(tmp_path)
-            _set_initial_prompt(None)
+            _set_asr_hints(initial_prompt or None, hotwords or None)
             result = _model.transcribe(audio, batch_size=BATCH_SIZE, language=lang)
             lang_code = result["language"]
 

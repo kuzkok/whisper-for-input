@@ -50,7 +50,7 @@ The split exists because Whisper model load is multi-second; the resident server
 
 **`PRELOAD_DIARIZE=1`** loads the pyannote pipeline at startup (adds ~5s + GPU memory). Off by default — diarization is the cold path. The transcribe model always loads at startup via the `lifespan` context manager.
 
-**`INITIAL_PROMPT` is per-endpoint, not per-model.** `whisperx.load_model()` bakes `initial_prompt` into `asr_options` once, so it would otherwise apply to both endpoints. `_set_initial_prompt()` mutates `_model.options` (a faster_whisper `TranscriptionOptions` dataclass) via `dataclasses.replace` before each call: `/transcribe` uses `INITIAL_PROMPT` (voice-input dictation context — improves Russian punctuation and keeps English tech terms in Latin script), `/diarize` uses `None` (arbitrary meeting/video content — the Russian prompt would bias Whisper to translate English speech to Russian even with `language="en"`).
+**ASR hints (`initial_prompt`, `hotwords`) are per-endpoint and per-request, not per-model.** `whisperx.load_model()` bakes `initial_prompt` into `asr_options` once and `hotwords` lives in the same faster_whisper `TranscriptionOptions` — neither can be passed to `transcribe()` directly. `_set_asr_hints()` mutates `_model.options` via `dataclasses.replace` before each call and always sets both fields: a forgotten field would leak from one request into the next through the shared model. `/transcribe` uses `INITIAL_PROMPT` (voice-input dictation context — improves Russian punctuation and keeps English tech terms in Latin script). `/diarize` defaults to no prompt (arbitrary meeting/video content — the Russian prompt would bias Whisper to translate English speech to Russian even with `language="en"`), but accepts optional `initial_prompt` and `hotwords` form fields for audio with known context (project terms, names, acronyms): in the whisperx batched pipeline the prompt is rebuilt for every VAD batch, so it applies to the whole recording, not just its start, and `hotwords` sit closest to the decoding window (strongest effect on rare terms). Both are bounded by the Whisper prompt window (~200+ tokens) — a short line of key terms, not a glossary; the server doesn't validate length, faster-whisper silently truncates. `cli/diarize.sh` passes them as `--prompt-file <path>` / `--hotwords <str>`.
 
 ## Common commands
 
@@ -76,7 +76,7 @@ docker compose logs -f
 # Rebuild image after server.py or Dockerfile changes — from whisper-for-input/
 # Bump the tag in whisper-for-input.container + docker-compose.yml first, then:
 cd whisper-for-input
-podman build -t whisper-for-input:20260917.1 -t whisper-for-input:latest .
+podman build -t whisper-for-input:20260917.2 -t whisper-for-input:latest .
 systemctl --user daemon-reload && systemctl --user restart whisper-for-input
 
 # Run voice-input directly for debugging (bypasses systemd) — from repo root
@@ -117,7 +117,7 @@ LD_LIBRARY_PATH="$PWD/../.venv/lib/python3.12/site-packages/nvidia/npp/lib" \
 ../.venv/bin/uvicorn server:app --reload  # ручная проверка с reload
 
 # Только когда `pytest -m gpu` зелёный — пересобирать образ
-podman build -t whisper-for-input:20260917.1 -t whisper-for-input:latest .
+podman build -t whisper-for-input:20260917.2 -t whisper-for-input:latest .
 systemctl --user restart whisper-for-input
 ```
 

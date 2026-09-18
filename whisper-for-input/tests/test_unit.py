@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import dataclasses
 import io
 import wave
 from typing import Any
@@ -32,16 +33,39 @@ def _silence_wav_bytes(seconds: float = 0.5, sample_rate: int = 16000) -> bytes:
     return buf.getvalue()
 
 
+@dataclasses.dataclass
+class _FakeOptions:
+    """Минимальный аналог faster_whisper.TranscriptionOptions.
+
+    Хватает полей, которые мутирует _set_asr_hints: dataclasses.replace в server.py
+    работает с любым dataclass с такими полями, тяжёлый настоящий класс не нужен.
+    """
+
+    initial_prompt: str | None = None
+    hotwords: str | None = None
+
+
 class _FakeModel:
     """Стаб _model — записывает аргументы вызова и возвращает заранее заданное."""
 
     def __init__(self, segments: list[dict[str, Any]], language: str = "ru"):
         self._segments = segments
         self._language = language
+        self.options = _FakeOptions()
         self.calls: list[dict[str, Any]] = []
 
     def transcribe(self, audio, batch_size, language):  # noqa: ARG002
-        self.calls.append({"batch_size": batch_size, "language": language})
+        # Снапшот подсказок на момент вызова — эндпоинт обязан выставить их
+        # ДО transcribe() (мутация options идёт перед ним), и тесты проверяют
+        # значения именно в этот момент.
+        self.calls.append(
+            {
+                "batch_size": batch_size,
+                "language": language,
+                "initial_prompt": self.options.initial_prompt,
+                "hotwords": self.options.hotwords,
+            }
+        )
         return {"segments": self._segments, "language": self._language}
 
 
@@ -71,14 +95,9 @@ def patched_server(monkeypatch):
         {"start": 1.0, "end": 2.0, "text": "мир"},
     ]
     fake_model = _FakeModel(default_segments, language="ru")
-    # Spy на _set_initial_prompt, чтобы юниты могли проверить что эндпоинт
-    # выставил правильный prompt перед вызовом transcribe.
-    prompt_calls: list = []
-
-    def fake_set_prompt(prompt):
-        prompt_calls.append(prompt)
-
-    monkeypatch.setattr(server, "_set_initial_prompt", fake_set_prompt)
+    # _set_asr_hints не мокаем: он мутирует fake_model.options по-настоящему
+    # (dataclasses.replace на _FakeOptions), а снапшот в _FakeModel.transcribe
+    # фиксирует значения на момент вызова.
 
     # Сегменты после assign_word_speakers — теперь со speaker label.
     spoken_segments = [
@@ -132,7 +151,6 @@ def patched_server(monkeypatch):
             "fake_diarize": fake_diarize,
             "diarize_calls": diarize_calls,
             "spoken_segments": spoken_segments,
-            "prompt_calls": prompt_calls,
         },
     )
 
@@ -346,30 +364,97 @@ def test_diarize_pipeline_constructed_with_explicit_model_name(patched_server):
     assert "token" in kwargs
 
 
-# ── Per-request initial_prompt ──────────────────────────────────────────────
+# ── Per-request ASR-подсказки: initial_prompt / hotwords ────────────────────
 
 
-def test_transcribe_sets_initial_prompt_to_configured_value(patched_server):
-    """/transcribe — voice-input диктовка, должен ставить INITIAL_PROMPT."""
+def test_transcribe_sets_initial_prompt_and_resets_hotwords(patched_server):
+    """/transcribe — voice-input диктовка: INITIAL_PROMPT и hotwords=None.
+    hotwords от предыдущего /diarize-запроса не должны утекать в диктовку
+    (options общие и мутируются на месте)."""
     resp = patched_server.client.post(
         "/transcribe",
         files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
         data={"language": "ru"},
     )
     assert resp.status_code == 200
-    assert patched_server.prompt_calls == [patched_server.module.INITIAL_PROMPT]
+    call = patched_server.fake_model.calls[-1]
+    assert call["initial_prompt"] == patched_server.module.INITIAL_PROMPT
+    assert call["hotwords"] is None
 
 
-def test_diarize_sets_initial_prompt_to_none(patched_server):
-    """/diarize — произвольная встреча, prompt должен быть None
-    (русский продовый prompt уведёт английскую речь в перевод)."""
+def test_diarize_without_hints_passes_none_for_both(patched_server):
+    """/diarize без новых полей — обе подсказки None (продовый русский
+    INITIAL_PROMPT уведёт английскую речь в перевод)."""
     resp = patched_server.client.post(
         "/diarize",
         files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
         data={"language": "ru"},
     )
     assert resp.status_code == 200
-    assert patched_server.prompt_calls == [None]
+    call = patched_server.fake_model.calls[-1]
+    assert call["initial_prompt"] is None
+    assert call["hotwords"] is None
+
+
+def test_diarize_initial_prompt_reaches_options(patched_server):
+    """initial_prompt из формы — в options к моменту transcribe()."""
+    resp = patched_server.client.post(
+        "/diarize",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={"language": "ru", "initial_prompt": "Встреча про Kubernetes и Prometheus."},
+    )
+    assert resp.status_code == 200
+    call = patched_server.fake_model.calls[-1]
+    assert call["initial_prompt"] == "Встреча про Kubernetes и Prometheus."
+    assert call["hotwords"] is None
+
+
+def test_diarize_hotwords_reaches_options(patched_server):
+    """hotwords из формы — в options к моменту transcribe()."""
+    resp = patched_server.client.post(
+        "/diarize",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={"language": "ru", "hotwords": "Kubernetes Prometheus Grafana"},
+    )
+    assert resp.status_code == 200
+    call = patched_server.fake_model.calls[-1]
+    assert call["initial_prompt"] is None
+    assert call["hotwords"] == "Kubernetes Prometheus Grafana"
+
+
+def test_diarize_prompt_and_hotwords_together(patched_server):
+    """Оба параметра одновременно — оба в options."""
+    resp = patched_server.client.post(
+        "/diarize",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={
+            "language": "ru",
+            "initial_prompt": "Ретро команды: ведущий Михаил.",
+            "hotwords": "ретро срез закупка",
+        },
+    )
+    assert resp.status_code == 200
+    call = patched_server.fake_model.calls[-1]
+    assert call["initial_prompt"] == "Ретро команды: ведущий Михаил."
+    assert call["hotwords"] == "ретро срез закупка"
+
+
+def test_diarize_hints_do_not_leak_between_requests(patched_server):
+    """Подсказки per-request: запрос БЕЗ полей сбрасывает то, что поставил
+    предыдущий запрос (options мутируются на месте, без сброса утекут)."""
+    for data in (
+        {"language": "ru", "initial_prompt": "утечёт?", "hotwords": "утечёт"},
+        {"language": "ru"},  # без полей — обе подсказки должны уйти в None
+    ):
+        resp = patched_server.client.post(
+            "/diarize",
+            files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+            data=data,
+        )
+        assert resp.status_code == 200
+    call = patched_server.fake_model.calls[-1]
+    assert call["initial_prompt"] is None
+    assert call["hotwords"] is None
 
 
 def test_transcribe_with_empty_initial_prompt_passes_none(monkeypatch, patched_server):
@@ -382,7 +467,9 @@ def test_transcribe_with_empty_initial_prompt_passes_none(monkeypatch, patched_s
         data={"language": "ru"},
     )
     assert resp.status_code == 200
-    assert patched_server.prompt_calls == [None]
+    call = patched_server.fake_model.calls[-1]
+    assert call["initial_prompt"] is None
+    assert call["hotwords"] is None
 
 
 def test_diarize_pipeline_cached_across_requests(patched_server):
