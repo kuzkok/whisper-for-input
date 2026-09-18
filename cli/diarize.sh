@@ -6,11 +6,14 @@
 #   ./diarize.sh call.m4a
 #   ./diarize.sh -l ru --min-speakers 2 --max-speakers 4 call.wav
 #   ./diarize.sh -u http://localhost:8000 -o out.txt call.mp3
+#   ./diarize.sh --prompt "Ретро-встреча команды" call.mp3
 #   ./diarize.sh --prompt-file gloss.txt --hotwords "Kubernetes Prometheus" call.mp3
+#   ./diarize.sh --prompt-file gloss.txt --hotwords-file terms.txt call.mp3
 #
-# --prompt-file — ASR-подсказка (initial_prompt) из файла: короткая строка
-#   с ключевыми терминами (~200 токенов), не глоссарий целиком.
-# --hotwords — ключевые слова через пробел; на термины действует сильнее промпта.
+# --prompt / --prompt-file — ASR-подсказка (initial_prompt) строкой или из
+#   файла: короткая строка с ключевыми терминами (~200 токенов), не глоссарий.
+# --hotwords / --hotwords-file — ключевые слова через пробел или из файла
+#   (по слову на строку); на термины действует сильнее промпта.
 
 set -euo pipefail
 
@@ -20,11 +23,13 @@ MIN_SPEAKERS=2
 MAX_SPEAKERS=10
 OUTPUT=""
 INPUT=""
+PROMPT_TEXT=""
 PROMPT_FILE=""
 HOTWORDS=""
+HOTWORDS_FILE=""
 
 usage() {
-    sed -n '2,13p' "$0" | sed 's/^# \?//'
+    sed -n '2,16p' "$0" | sed 's/^# \?//'
     exit "${1:-0}"
 }
 
@@ -35,8 +40,10 @@ while [[ $# -gt 0 ]]; do
         --min-speakers)    MIN_SPEAKERS="$2"; shift 2 ;;
         --max-speakers)    MAX_SPEAKERS="$2"; shift 2 ;;
         -o|--output)       OUTPUT="$2"; shift 2 ;;
+        --prompt)          PROMPT_TEXT="$2"; shift 2 ;;
         --prompt-file)     PROMPT_FILE="$2"; shift 2 ;;
         --hotwords)        HOTWORDS="$2"; shift 2 ;;
+        --hotwords-file)   HOTWORDS_FILE="$2"; shift 2 ;;
         -h|--help)         usage 0 ;;
         -*)                echo "unknown option: $1" >&2; usage 1 ;;
         *)
@@ -60,6 +67,18 @@ if [[ -n "$PROMPT_FILE" && ! -f "$PROMPT_FILE" ]]; then
     echo "файл промпта не найден: $PROMPT_FILE" >&2
     exit 1
 fi
+if [[ -n "$PROMPT_TEXT" && -n "$PROMPT_FILE" ]]; then
+    echo "--prompt и --prompt-file взаимоисключаемы" >&2
+    exit 1
+fi
+if [[ -n "$HOTWORDS_FILE" && ! -f "$HOTWORDS_FILE" ]]; then
+    echo "файл hotwords не найден: $HOTWORDS_FILE" >&2
+    exit 1
+fi
+if [[ -n "$HOTWORDS" && -n "$HOTWORDS_FILE" ]]; then
+    echo "--hotwords и --hotwords-file взаимоисключаемы" >&2
+    exit 1
+fi
 if [[ -z "$OUTPUT" ]]; then
     OUTPUT="${INPUT%.*}.txt"
 fi
@@ -71,8 +90,17 @@ EXTRA_ARGS=()
 EXTRA_LOG=""
 if [[ -n "$PROMPT_FILE" ]]; then
     PROMPT="$(cat "$PROMPT_FILE")"
-    EXTRA_ARGS+=(--form-string "initial_prompt=${PROMPT}")
     EXTRA_LOG+=" prompt_file=$(basename "$PROMPT_FILE")"
+else
+    PROMPT="$PROMPT_TEXT"
+    [[ -n "$PROMPT" ]] && EXTRA_LOG+=" prompt=${PROMPT:0:40}"
+fi
+[[ -n "$PROMPT" ]] && EXTRA_ARGS+=(--form-string "initial_prompt=${PROMPT}")
+if [[ -n "$HOTWORDS_FILE" ]]; then
+    # Файл — по слову на строку; в form-поле — строка через пробел.
+    HOTWORDS="$(tr '\n' ' ' < "$HOTWORDS_FILE" | tr -s ' ')"
+    HOTWORDS="${HOTWORDS# }"; HOTWORDS="${HOTWORDS% }"
+    EXTRA_LOG+=" hotwords_file=$(basename "$HOTWORDS_FILE")"
 fi
 if [[ -n "$HOTWORDS" ]]; then
     EXTRA_ARGS+=(--form-string "hotwords=${HOTWORDS}")
