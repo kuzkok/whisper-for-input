@@ -155,6 +155,93 @@ def patched_server(monkeypatch):
     )
 
 
+# ── /health: метрики GPU-памяти ─────────────────────────────────────────────
+
+
+def test_health_gpu_memory_schema_when_cuda_initialized(monkeypatch, patched_server):
+    """gpu_memory с поднятым CUDA-контекстом: MiB-числа из torch.cuda-метрик.
+    device_used = total - free (аналог used в nvidia-smi)."""
+    monkeypatch.setattr("torch.cuda.is_initialized", lambda: True)
+    monkeypatch.setattr("torch.cuda.mem_get_info", lambda: (2 * 2**30, 8 * 2**30))
+    monkeypatch.setattr("torch.cuda.memory_allocated", lambda: int(0.5 * 2**30))
+    monkeypatch.setattr("torch.cuda.memory_reserved", lambda: int(1.5 * 2**30))
+    resp = patched_server.client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["gpu_memory"] == {
+        "torch_allocated_mib": 512,
+        "torch_reserved_mib": 1536,
+        "device_total_mib": 8192,
+        "device_used_mib": 6144,
+        "device_free_mib": 2048,
+    }
+
+
+def test_health_gpu_memory_null_when_cuda_not_initialized(monkeypatch, patched_server):
+    """Без CUDA-контекста gpu_memory = None: /health не должен поднимать
+    контекст сам (иначе каждый health-check занимал бы VRAM на карте)."""
+    monkeypatch.setattr("torch.cuda.is_initialized", lambda: False)
+    resp = patched_server.client.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["gpu_memory"] is None
+
+
+# ── /diarize: возврат арен после тяжёлого запроса ───────────────────────────
+
+
+@pytest.fixture
+def empty_cache_calls(monkeypatch):
+    """Мок torch.cuda.empty_cache, считающий вызовы; CUDA «инициализирована»."""
+    calls = []
+    monkeypatch.setattr("torch.cuda.is_initialized", lambda: True)
+    monkeypatch.setattr("torch.cuda.empty_cache", lambda: calls.append(1))
+    return calls
+
+
+def test_diarize_calls_empty_cache_afterwards(empty_cache_calls, patched_server):
+    """/diarize — тяжёлый запрос: арены align/pyannote возвращаются драйверу,
+    иначе повторный длинный /diarize падает с CUDA OOM (measured: 2,7 ГБ арен)."""
+    resp = patched_server.client.post(
+        "/diarize",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={"language": "ru"},
+    )
+    assert resp.status_code == 200
+    assert len(empty_cache_calls) == 1
+
+
+def test_diarize_calls_empty_cache_even_when_pipeline_fails(empty_cache_calls, patched_server):
+    """OOM внутри пайплайна не должен оставлять арены до рестарта: empty_cache
+    стоит в finally и выполняется независимо от исхода запроса."""
+    def _boom(*args, **kwargs):
+        raise RuntimeError("CUDA failed with error out of memory")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(patched_server.module.whisperx, "align", _boom)
+    # Обычный TestClient пробрасывает исключение сервера в тест вместо
+    # ответа 500 — здесь проверяем именно finally-путь, поэтому глушим.
+    client = TestClient(patched_server.module.app, raise_server_exceptions=False)
+    resp = client.post(
+        "/diarize",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={"language": "ru"},
+    )
+    monkeypatch.undo()
+    assert resp.status_code == 500
+    assert len(empty_cache_calls) == 1
+
+
+def test_transcribe_does_not_call_empty_cache(empty_cache_calls, patched_server):
+    """/transcribe — hot path voice-input: его арены малы (короткие клипы),
+    empty_cache здесь только добавил бы задержку на регрейд арен."""
+    resp = patched_server.client.post(
+        "/transcribe",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={"language": "ru"},
+    )
+    assert resp.status_code == 200
+    assert empty_cache_calls == []
+
+
 # ── /transcribe ─────────────────────────────────────────────────────────────
 
 

@@ -135,6 +135,12 @@ def test_health_after_diarize_loads(integration_client, ru_short_fixture, jfk_fi
     assert health["diarize_loaded"] is True
     assert "ru" in health["align_languages_loaded"]
     assert "en" in health["align_languages_loaded"]
+    # После реального GPU-прогона контекст поднят — метрики памяти обязаны
+    # быть ненулевыми (веса ASR/align/pyannote живут в torch_reserved).
+    gpu = health["gpu_memory"]
+    assert gpu is not None, "CUDA-контекст поднят, а gpu_memory нет"
+    assert gpu["torch_reserved_mib"] > 0
+    assert gpu["device_used_mib"] >= gpu["torch_reserved_mib"]
 
 
 # ── PRELOAD_DIARIZE=1: отдельная сессия ────────────────────────────────────

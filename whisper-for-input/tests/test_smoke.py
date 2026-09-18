@@ -74,8 +74,12 @@ def test_health_schema():
         "compute_type",
         "diarize_loaded",
         "align_languages_loaded",
+        "gpu_memory",
     }
     assert expected_keys <= set(body.keys()), f"missing keys: {expected_keys - set(body.keys())}"
     assert body["status"] == "ok"
     assert body["diarize_loaded"] is False
     assert body["align_languages_loaded"] == []
+    # Без загруженной модели CUDA-контекста нет — /health не должен его
+    # создавать (mem_get_info аллоцирует контекст при первом обращении).
+    assert body["gpu_memory"] is None

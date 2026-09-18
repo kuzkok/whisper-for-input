@@ -14,7 +14,7 @@ After=network.target
 # Тег запинен намеренно: рестарт юнита не должен подхватывать случайно
 # пересобранный :latest. Значение держится в одном виде с docker-compose.yml,
 # бампится вручную при пересборке.
-Image=localhost/whisper-for-input:20260917.2
+Image=localhost/whisper-for-input:20260918.1
 PublishPort=127.0.0.1:8000:8000
 # Map the calling host user to the in-container `whisper` user
 # (UID/GID 5000). The mounted models/ and torch-cache/ dirs (owned by the

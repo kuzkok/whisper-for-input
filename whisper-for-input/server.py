@@ -13,6 +13,7 @@ import threading
 from contextlib import asynccontextmanager
 
 import nltk
+import torch
 import whisperx
 from fastapi import FastAPI, File, Form, UploadFile
 from fastapi.responses import JSONResponse
@@ -264,6 +265,17 @@ def diarize(
             diarize_segments = pipe(audio, **diarize_kwargs)
             result = whisperx.assign_word_speakers(diarize_segments, result)
     finally:
+        # После /diarize возвращаем драйверу арены, выросшие под align/pyannote.
+        # Без этого caching allocator держит ~2,7 ГБ зарезервированными (арены
+        # не фрагментированы, но и не переиспользуются под новый запрос), и
+        # повторный длинный /diarize падает с CUDA OOM уже на encode первого
+        # батча — measured: reserved 3962 MiB при allocated 1250, free 441.
+        # empty_cache не трогает живые тензоры (веса моделей остаются в VRAM),
+        # платим повторным выделением арен следующим тяжёлым запросом.
+        # Вызов в finally, а не в теле: упавший OOM-запрос тоже обязан
+        # вернуть арены, иначе процесс до рестарта остаётся заблокирован.
+        if DEVICE == "cuda" and torch.cuda.is_initialized():
+            torch.cuda.empty_cache()
         os.unlink(tmp_path)
 
     segments = [
@@ -297,6 +309,36 @@ def diarize(
     return JSONResponse({"language": lang_code, "segments": segments})
 
 
+def _gpu_memory():
+    """Снимок VRAM для /health. None, если CUDA-контекст ещё не поднят.
+
+    Гвард is_initialized(), а не is_available(): mem_get_info() сам создаёт
+    CUDA-контекст при первом обращении. В проде контекст уже есть (lifespan
+    грузит модель на cuda при старте), а вот /health у процесса без модели —
+    unit-тесты, cpu-режим — не должен аллоцировать VRAM на карте.
+
+    Числа в MiB, как в nvidia-smi:
+    - torch_allocated — живые тензоры torch (align, pyannote);
+    - torch_reserved — всё, что держит caching allocator (allocated + арены);
+    - device_* — карта целиком из mem_get_info: total - free включает веса
+      CTranslate2, CUDA-контексты и чужие процессы (kwin и т.п.), то есть
+      сопоставимо со строкой used в nvidia-smi.
+    Разница device_used - torch_reserved — это CTranslate2 с контекстами;
+    разница torch_reserved - torch_allocated — зарезервированные, но
+    не занятые тензорами арены (кандидат на empty_cache после /diarize).
+    """
+    if not torch.cuda.is_initialized():
+        return None
+    free, total = torch.cuda.mem_get_info()
+    return {
+        "torch_allocated_mib": round(torch.cuda.memory_allocated() / 2**20),
+        "torch_reserved_mib": round(torch.cuda.memory_reserved() / 2**20),
+        "device_total_mib": round(total / 2**20),
+        "device_used_mib": round((total - free) / 2**20),
+        "device_free_mib": round(free / 2**20),
+    }
+
+
 @app.get("/health")
 async def health():
     return {
@@ -308,4 +350,5 @@ async def health():
         "align_languages_loaded": sorted(_align_models.keys()),
         "punkt_available": _punkt_available(),
         "busy": _gpu_lock.locked(),
+        "gpu_memory": _gpu_memory(),
     }

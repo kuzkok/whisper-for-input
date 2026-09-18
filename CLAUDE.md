@@ -46,6 +46,8 @@ The split exists because Whisper model load is multi-second; the resident server
 
 **`WHISPER_BATCH_SIZE=8` is a measured ceiling, not a guess.** On the 6GB RTX 3060 each unit of batch costs ~230MB of VRAM in the ASR phase (peak: 2590MB at 4, 3518MB at 8, 4446MB at 12, 5374MB at 16, OOM at 20). Speed barely moves: 10 minutes of audio transcribe in 8.5s at batch 4 vs 7.5s at batch 12, and a 6-second voice-input clip takes ~0.4s regardless. In `/diarize` the ASR phase is a few seconds out of minutes, and the real peak (~5.2GB, both at 10 and 34 minutes of input) comes from align + pyannote, not from the batch. So a bigger batch buys nothing measurable and eats the headroom the desktop shares: 16 works on an idle GPU and dies with `CUDA failed with error out of memory` as soon as a browser takes its slice.
 
+**`/diarize` releases VRAM after every request (`torch.cuda.empty_cache()` in the handler's `finally`).** Without it the PyTorch caching allocator kept ~2.7GB of arenas grown during a long request's align+pyannote phases (measured: `torch_reserved` 3962 MiB with `torch_allocated` at 1250 — the live weights; the next request doesn't reuse those arenas, and they can't grow — only ~440 MiB free on the card), so a second long `/diarize` died with CUDA OOM at the first batch's encode — inside CTranslate2, which has its own allocator and no access to torch arenas. `empty_cache` doesn't touch live tensors (the align/pyannote weights stay resident); the next heavy request pays re-growing the arenas, which is not measurable in time (24.7 min of audio: 1m45s with the fix vs 1m47s without). The call sits in `finally` on purpose: a request that died with OOM must also return its arenas, or the process stays wedged until a restart. `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True` was tried too — arenas end up more compact (2900 instead of 3962), but the OOM on a repeated long request remained, so the config is not enabled. `/health` reports `gpu_memory`: `torch_allocated`/`torch_reserved` plus `device_used`/`device_free` (MiB; null until the CUDA context is up — `/health` must not create it itself). `device_used - torch_reserved` ≈ CTranslate2 with CUDA contexts (~1400 MiB).
+
 **Alignment model cache is per-language and lazy.** `server.py:_align_models` keys by language code; the Russian wav2vec2 is pre-downloaded, English is fetched on first English `/diarize`. Languages without pre-cached weights will fail in offline mode.
 
 **`PRELOAD_DIARIZE=1`** loads the pyannote pipeline at startup (adds ~5s + GPU memory). Off by default — diarization is the cold path. The transcribe model always loads at startup via the `lifespan` context manager.
@@ -76,7 +78,7 @@ docker compose logs -f
 # Rebuild image after server.py or Dockerfile changes — from whisper-for-input/
 # Bump the tag in whisper-for-input.container + docker-compose.yml first, then:
 cd whisper-for-input
-podman build -t whisper-for-input:20260917.2 -t whisper-for-input:latest .
+podman build -t whisper-for-input:20260918.1 -t whisper-for-input:latest .
 systemctl --user daemon-reload && systemctl --user restart whisper-for-input
 
 # Run voice-input directly for debugging (bypasses systemd) — from repo root
@@ -127,7 +129,7 @@ LD_LIBRARY_PATH="$PWD/../.venv/lib/python3.12/site-packages/nvidia/npp/lib" \
 ../.venv/bin/uvicorn server:app --reload  # ручная проверка с reload
 
 # Только когда `pytest -m gpu` зелёный — пересобирать образ
-podman build -t whisper-for-input:20260917.2 -t whisper-for-input:latest .
+podman build -t whisper-for-input:20260918.1 -t whisper-for-input:latest .
 systemctl --user restart whisper-for-input
 ```
 
@@ -140,3 +142,7 @@ Audio-фикстуры (`tests/fixtures/{ru_short.ogx,jfk.wav}`) хранятс�
 - **`type_text()` uses `wl-copy` + `xdotool key shift+Insert`**, not `ydotool type`. This is intentional for Cyrillic — `ydotool type` mangles non-ASCII on most layouts. Don't "simplify" it back.
 - **Container is rootless Podman with `SecurityLabelDisable=true` / `label:disable`**. SELinux relabel (`:z`) on the model volume is needed; don't drop it.
 - **`HF_HUB_OFFLINE=1` is a guardrail, not a constraint to work around.** If a model isn't loading, the fix is to add it to `download-models.sh`, not to enable network in the container.
+
+## Confidentiality
+
+Audio that users bring for testing (meetings, calls, voice notes) is private, and its transcripts can name real people, companies, and projects. Never copy that material into repository artifacts — task documents (`tasks/`), specs, commit messages, test code or fixtures, logs checked into the repo. Refer to such files generically ("a 24.7-minute meeting recording provided by the user"); don't record filenames or paths that reveal what the recording is. The same applies to identifiers surfaced while working with user content — people's names, company and project names, codenames: keep them out of files, including examples and test data. Public fixtures under `whisper-for-input/tests/fixtures/` with their license sidecars are the exception — they are meant to be in the repo.
