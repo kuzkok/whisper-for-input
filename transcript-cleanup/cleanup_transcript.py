@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Чистка диаризованного транскрипта: карта спикеров + глоссарные правки.
 
-Usage: cleanup_transcript.py <source> <context-file> [-o out] [--yes]
+Usage: cleanup_transcript.py <source> <context-file> [-o out] [--yes] [--workers N]
 
 Вход — транскрипт вида «[HH:MM:SS] [SPEAKER_XX] текст» (выход cli/diarize.sh)
 плюс проектный контекст-файл. Выход — тот же каркас с именами вместо
@@ -11,7 +11,8 @@ SPEAKER_XX (где спикер опознан по содержанию) и в�
   1. sonnet строит карту «SPEAKER_XX → имя» по скелету встречи (первые ~30
      слов каждой реплики); карта показывается, подтверждается по stdin
      (или --yes); подстановка имён — детерминированная замена строк здесь.
-  2. haiku чистит текст чанками по ~40 реплик; каркас (таймкоды, метки)
+  2. haiku чистит текст чанками по ~40 реплик; чанки независимы и идут
+     пулом потоков (--workers, по умолчанию 3); каркас (таймкоды, метки)
      через модель не проходит — скрипт сшивает выход сам.
 
 LLM вызывается только в inference-режиме: JSON на входе, schema-валидный
@@ -24,6 +25,8 @@ import json
 import re
 import subprocess
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,16 +39,22 @@ MAX_RETRIES = 2
 PHASE1_MODEL = "sonnet"
 PHASE2_MODEL = "haiku"
 PHASE1_TIMEOUT_S = 300
-# Фаза 2: 420 с — роутер может отдавать под слотом haiku медленную модель
-# (прогон на sonnet через роутер таймаутил чанк на 180 с и уходил в ретрай).
+# Фаза 2: 420 с — под слотом haiku может оказаться медленная модель (на
+# корпоративном роутере чанк таймаутил на 180 с и уходил в ретрай); нативный
+# claude-haiku-4-5 укладывается примерно в 4 минуты на чанк из 40 реплик.
 PHASE2_TIMEOUT_S = 420
-# Пороги --max-budget-usd: через корпоративный роутер это фиктивный счётчик
-# (costBasis unknown, без кэширования промптов) — числа подобраны под него;
-# на подписке или официальном API вызов дешевле на порядок, менять не требуется.
-# Фаза 2: $1.50 с запасом — счётчик роутера тарифицирует чанк по полному
-# входу (~23k токенов с обвязкой CLI); у sonnet-слота 180 с/`$0.30` не хватало.
+# Пороги --max-budget-usd. На подписке счётчик считает list price (costBasis
+# list, кэш общего префикса работает — system prompt и контекст-файл чанки
+# читают из кэша), реальных списаний нет: пороги остаются страховкой от
+# зацикливания. На корпоративном роутере счётчик был фиктивным и щедрее по
+# токенам (costBasis unknown, без кэша) — под него числа и подбирались, запас
+# сохраняется в обоих режимах.
 PHASE1_BUDGET_USD = "0.50"
 PHASE2_BUDGET_USD = "1.50"
+# Фаза 2 идёт пулом потоков: чанки независимы (контекст края берётся из
+# исходника, а не из выхода предыдущего чанка). 3 — компромисс между временем
+# прогона и расходом usage-окна подписки; 1 возвращает последовательный прогон.
+PHASE2_WORKERS = 3
 
 # Каркас: [HH:MM:SS] [метка] текст. Метка — SPEAKER_XX или UNKNOWN.
 LINE_RE = re.compile(r"^\[(\d{2}:\d{2}:\d{2})\] \[([^\]]+)\] (.*)$")
@@ -91,6 +100,75 @@ SCHEMA_CLEAN = {
     "required": ["cleaned"],
     "additionalProperties": False,
 }
+
+
+# Журнал вызовов: envelope каждого вызова несёт total_cost_usd и usage с
+# метриками кэша (на подписке — list price, деньги не списываются). Пишется в
+# call_claude, а не в возвращаемое значение, чтобы не ломать сигнатуру для
+# вызывающих и тестов; фаза 2 пишет из нескольких потоков, отсюда lock.
+#
+# Кэш префикса живёт на стороне API (ключ — байты префикса + модель, область —
+# workspace), переживает отдельные запуски `claude` и держится час: CLI пишет
+# записи под 1h TTL. Общий префикс чанков — обвязка CLI и наш system prompt;
+# контекст-файл в него не входит, он лежит в payload после `replicas`, которые
+# у каждого чанка свои. Растущий cache_read на чанках 2+ — признак, что прогрев
+# первым чанком работает; cache_creation на каждом чанке означает, что префикс
+# переписывается и прогрев ничего не даёт.
+_cost_lock = threading.Lock()
+_cost_usd = 0.0
+_calls: list[dict] = []
+
+
+def add_cost(usd: float) -> None:
+    global _cost_usd
+    with _cost_lock:
+        _cost_usd += usd
+
+
+def record_call(model: str, usd: float, usage: dict) -> None:
+    def n(key: str) -> int:
+        v = usage.get(key)
+        return v if isinstance(v, int) else 0
+
+    with _cost_lock:
+        _calls.append({
+            "model": model,
+            "usd": usd,
+            "cache_read": n("cache_read_input_tokens"),
+            "cache_write": n("cache_creation_input_tokens"),
+            "fresh": n("input_tokens"),
+        })
+
+
+def spent_usd() -> float:
+    with _cost_lock:
+        return _cost_usd
+
+
+def call_log() -> list[dict]:
+    with _cost_lock:
+        return list(_calls)
+
+
+def print_call_log() -> None:
+    """Токены и кэш по вызовам — в порядке завершения (фаза 2 идёт пулом)."""
+    calls = call_log()
+    if not calls:
+        return
+    print("\nтокены по вызовам (порядок завершения):", file=sys.stderr)
+    for i, c in enumerate(calls, start=1):
+        print(
+            f"  {i:2d} {c['model']:7} из кэша {c['cache_read']:7} | "
+            f"в кэш {c['cache_write']:7} | полный тариф {c['fresh']:6} | ${c['usd']:.2f}",
+            file=sys.stderr,
+        )
+    reported = any(c["cache_write"] or c["fresh"] for c in calls)
+    if reported and all(c["cache_read"] == 0 for c in calls[1:]):
+        print(
+            "  кэш префикса не читался ни разу — прогрев первым чанком бесполезен, "
+            "префикс переписывается на каждом вызове",
+            file=sys.stderr,
+        )
 
 
 @dataclass
@@ -269,6 +347,12 @@ def call_claude(
         tail = ((e.stderr or "") + (e.stdout or ""))[-800:]
         raise RuntimeError(f"claude -p rc={e.returncode}; tail: {tail!r}") from e
     envelope = json.loads(proc.stdout)
+    cost = envelope.get("total_cost_usd")
+    cost = float(cost) if isinstance(cost, (int, float)) else 0.0
+    usage = envelope.get("usage")
+    # до проверок ниже: неудачный вызов тоже стоил денег и тоже трогал кэш
+    add_cost(cost)
+    record_call(model, cost, usage if isinstance(usage, dict) else {})
     if envelope.get("is_error"):
         raise RuntimeError(f"claude -p reported is_error: {envelope.get('result', '')!r}")
     structured = envelope.get("structured_output")
@@ -439,6 +523,61 @@ def clean_chunk(
     raise RuntimeError(f"{label}: исчерпаны {MAX_RETRIES + 1} попыток; последняя: {last_err}")
 
 
+def clean_all_chunks(
+    chunk_prompt: str,
+    named: list[Replica],
+    chunks: list[list[Replica]],
+    context_file: str,
+    workers: int = PHASE2_WORKERS,
+) -> list[list[str]]:
+    """Очищенные тексты всех чанков — список по чанку, в исходном порядке.
+
+    Чанки независимы: контекст края берётся из `named` (исходник с
+    подставленными метками), а не из выхода предыдущего чанка, поэтому фаза 2
+    распараллеливается пулом потоков — каждый вызов блокируется на subprocess,
+    GIL не мешает. Первый чанк идёт отдельно: он создаёт кэш общего префикса
+    (system prompt + контекст-файл), остальные его читают, а холодный веер
+    платил бы за запись кэша столько раз, сколько воркеров. Порядок результатов
+    восстанавливается по входу, а не по времени завершения. Чанк, исчерпавший
+    ретраи, валит всю фазу (выход всё-или-ничего); ещё не начатые чанки при
+    этом отменяются, уже запущенные доживают до своего ответа.
+    """
+    total = len(chunks)
+    if not total:
+        return []
+    offsets: list[int] = []
+    consumed = 0
+    for chunk in chunks:
+        offsets.append(consumed)
+        consumed += len(chunk)
+
+    def run(idx: int) -> list[str]:
+        chunk = chunks[idx]
+        label = f"чанк {idx + 1}/{total}"
+        before = sum(len(r.text) for r in chunk)
+        cleaned = clean_chunk(
+            chunk_prompt, chunk, context_lines(named, offsets[idx]), context_file, label
+        )
+        after = sum(len(s) for s in cleaned)
+        print(
+            f"{label}: {len(chunk)} реплик, {before}→{after} симв "
+            f"({(after - before) / before * 100:+.1f}%)",
+            file=sys.stderr,
+        )
+        return cleaned
+
+    results = [run(0)]
+    rest = list(range(1, total))
+    if not rest:
+        return results
+    if workers > 1:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            results.extend(pool.map(run, rest))  # map отдаёт в порядке входа
+    else:
+        results.extend(run(i) for i in rest)
+    return results
+
+
 # ── верификации ──────────────────────────────────────────────────────────────
 
 
@@ -466,6 +605,7 @@ def verify_final(
 def main() -> int:
     args = sys.argv[1:]
     yes = False
+    workers = PHASE2_WORKERS
     out_path_arg = None
     positional: list[str] = []
     i = 0
@@ -479,6 +619,19 @@ def main() -> int:
                 print("-o требует аргумент", file=sys.stderr)
                 return 2
             out_path_arg = args[i]
+        elif a == "--workers":
+            i += 1
+            if i >= len(args):
+                print("--workers требует аргумент", file=sys.stderr)
+                return 2
+            try:
+                workers = int(args[i])
+            except ValueError:
+                print(f"--workers: ожидалось число, получено {args[i]!r}", file=sys.stderr)
+                return 2
+            if workers < 1:
+                print("--workers: минимум 1", file=sys.stderr)
+                return 2
         elif a in ("-h", "--help"):
             print(__doc__.strip())
             return 0
@@ -487,7 +640,8 @@ def main() -> int:
         i += 1
     if len(positional) != 2:
         print(
-            "usage: cleanup_transcript.py <source> <context-file> [-o out] [--yes]",
+            "usage: cleanup_transcript.py <source> <context-file> "
+            "[-o out] [--yes] [--workers N]",
             file=sys.stderr,
         )
         return 2
@@ -533,6 +687,7 @@ def main() -> int:
         file=sys.stderr,
     )
     mapping, evidence = map_speakers(map_prompt, skeleton, context_file)
+    phase1_cost = spent_usd()
     if yes:
         print_map(mapping, evidence)
         print("--yes: карта принята без подтверждения", file=sys.stderr)
@@ -543,25 +698,23 @@ def main() -> int:
 
     # Фаза 2 — чанковая чистка
     chunks = chunk_replicas(named)
-    print(f"{len(chunks)} чанков по <= {CHUNK_REPLICAS} реплик", file=sys.stderr)
+    print(
+        f"{len(chunks)} чанков по <= {CHUNK_REPLICAS} реплик, воркеров: {workers}",
+        file=sys.stderr,
+    )
+    cleaned_by_chunk = clean_all_chunks(
+        chunk_prompt, named, chunks, context_file, workers
+    )
     cleaned_replicas: list[Replica] = []
-    consumed = 0
-    delta_chars = 0
-    for idx, chunk in enumerate(chunks, start=1):
-        label = f"чанк {idx}/{len(chunks)}"
-        ctx = context_lines(named, consumed)
-        before = sum(len(r.text) for r in chunk)
-        cleaned = clean_chunk(chunk_prompt, chunk, ctx, context_file, label)
-        after = sum(len(s) for s in cleaned)
-        delta_chars += after - before
-        print(
-            f"{label}: {len(chunk)} реплик, {before}→{after} симв "
-            f"({(after - before) / before * 100:+.1f}%)",
-            file=sys.stderr,
-        )
+    for chunk, cleaned in zip(chunks, cleaned_by_chunk):
         for r, text in zip(chunk, cleaned):
             cleaned_replicas.append(Replica(r.time, r.label, text.strip()))
-        consumed += len(chunk)
+    print_call_log()
+    print(
+        f"счётчик CLI: фаза 1 ${phase1_cost:.2f}, фаза 2 ${spent_usd() - phase1_cost:.2f}, "
+        f"итого ${spent_usd():.2f} (list price; на подписке не списывается)",
+        file=sys.stderr,
+    )
 
     # Верификация и запись
     problems = verify_final(src, cleaned_replicas, named)

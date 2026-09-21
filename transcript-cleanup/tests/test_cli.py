@@ -52,6 +52,25 @@ class CliTests(unittest.TestCase):
         self.assertEqual(proc.returncode, 2)
         self.assertIn("--yes", proc.stderr)
 
+    def test_parallel_run_matches_sequential(self):
+        """Пул не меняет результат: фейк детерминированный, выход обязан совпасть."""
+        seq_out = Path(self.tmp.name) / "seq.txt"
+        par_out = Path(self.tmp.name) / "par.txt"
+        seq = self.run_script(str(self.src), str(self.ctx),
+                              "-o", str(seq_out), "--yes", "--workers", "1")
+        self.assertEqual(seq.returncode, 0, seq.stderr)
+        par = self.run_script(str(self.src), str(self.ctx),
+                              "-o", str(par_out), "--yes", "--workers", "3")
+        self.assertEqual(par.returncode, 0, par.stderr)
+        self.assertEqual(seq_out.read_text(), par_out.read_text())
+        self.assertIn("воркеров: 3", par.stderr)
+
+    def test_bad_workers_value_refused(self):
+        proc = self.run_script(str(self.src), str(self.ctx), "-o", str(self.out),
+                               "--yes", "--workers", "0")
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("--workers", proc.stderr)
+
     def test_full_run_with_yes(self):
         proc = self.run_script(str(self.src), str(self.ctx),
                                "-o", str(self.out), "--yes")
