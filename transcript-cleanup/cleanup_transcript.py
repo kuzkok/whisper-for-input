@@ -26,6 +26,7 @@ import re
 import subprocess
 import sys
 import threading
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -95,9 +96,26 @@ SCHEMA_MAP = {
 SCHEMA_CLEAN = {
     "type": "object",
     "properties": {
-        "cleaned": {"type": "array", "items": {"type": "string"}, "minItems": 1}
+        "cleaned": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+        # Догадки: замены, у которых нет пары в контекст-файле. Модель обязана
+        # отчитаться о каждой (пустой массив, если их нет) — иначе они уходят в
+        # текст незаметно, а именно на них ловятся её выдумки.
+        "guesses": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "n": {"type": "integer"},
+                    "from": {"type": "string"},
+                    "to": {"type": "string"},
+                    "basis": {"type": "string"},
+                },
+                "required": ["n", "from", "to", "basis"],
+                "additionalProperties": False,
+            },
+        },
     },
-    "required": ["cleaned"],
+    "required": ["cleaned", "guesses"],
     "additionalProperties": False,
 }
 
@@ -117,6 +135,14 @@ SCHEMA_CLEAN = {
 _cost_lock = threading.Lock()
 _cost_usd = 0.0
 _calls: list[dict] = []
+
+# Журнал догадок: замены без пары в контекст-файле, о которых модель отчиталась
+# в `guesses`. Пишется здесь же, а не в возвращаемое значение clean_chunk, по той
+# же причине, что и журнал вызовов. Номер реплики внутри чанка превращается в
+# таймкод сразу при записи: дальше по коду чанков уже нет, а таймкод — то, по
+# чему догадку ищут глазами в выходе.
+_guess_lock = threading.Lock()
+_guesses: list[dict] = []
 
 
 def add_cost(usd: float) -> None:
@@ -169,6 +195,59 @@ def print_call_log() -> None:
             "префикс переписывается на каждом вызове",
             file=sys.stderr,
         )
+
+
+def record_guesses(raw: object, chunk: list["Replica"], label: str) -> None:
+    """Догадки чанка → журнал. `n` — номер реплики внутри чанка (1-based), он же
+    переводится в таймкод. Запись вне диапазона не валит прогон: это отчётность,
+    а не выход, и терять из-за неё уже очищенный чанк нечем оправдать."""
+    if not isinstance(raw, list):
+        return
+    rows = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        n = item.get("n")
+        if not isinstance(n, int) or not 1 <= n <= len(chunk):
+            print(f"  {label}: догадка с номером реплики {n!r} вне чанка, пропущена",
+                  file=sys.stderr)
+            continue
+        rows.append({
+            "time": chunk[n - 1].time,
+            "from": str(item.get("from", "")),
+            "to": str(item.get("to", "")),
+            "basis": str(item.get("basis", "")),
+        })
+    if rows:
+        with _guess_lock:
+            _guesses.extend(rows)
+
+
+def guess_log() -> list[dict]:
+    with _guess_lock:
+        return list(_guesses)
+
+
+def print_guess_log() -> None:
+    """Догадки группами «было → стало», с числом вхождений и таймкодами.
+
+    Это главный ручной контроль выхода: замены по парам контекст-файла видны
+    грепом, а догадки — нет. Каждая строка либо превращается в пару глоссария,
+    либо означает, что модель выдумала.
+    """
+    rows = guess_log()
+    if not rows:
+        return
+    groups: dict[tuple[str, str], list[dict]] = {}
+    for r in rows:
+        groups.setdefault((r["from"], r["to"]), []).append(r)
+    print(f"\nдогадки без пары в контекст-файле ({len(rows)}):", file=sys.stderr)
+    for (frm, to), items in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        times = ", ".join(i["time"] for i in items[:6])
+        if len(items) > 6:
+            times += f", … (+{len(items) - 6})"
+        print(f"  {frm!r} → {to!r}  ×{len(items)}  [{times}]", file=sys.stderr)
+        print(f"      {items[0]['basis']}", file=sys.stderr)
 
 
 @dataclass
@@ -510,6 +589,8 @@ def clean_chunk(
                 raise RuntimeError(f"длина массива {len(cleaned)} != {len(chunk)} реплик")
             if any(not s.strip() for s in cleaned):
                 raise RuntimeError("пустые строки в cleaned")
+            # После проверок: догадки неудачной попытки в журнал не попадают.
+            record_guesses(out.get("guesses"), chunk, label)
             return cleaned
         except (
             subprocess.CalledProcessError,
@@ -579,6 +660,85 @@ def clean_all_chunks(
 
 
 # ── верификации ──────────────────────────────────────────────────────────────
+
+WORD_RE = re.compile(r"[0-9A-Za-zА-Яа-яЁё][0-9A-Za-zА-Яа-яЁё\-.]*")
+
+
+def _words(text: str) -> Counter:
+    """Мультимножество слов реплики. Регистр и «ё» нормализуются: их правка
+    разрешена политикой и потерей слова не является."""
+    out: Counter = Counter()
+    for w in WORD_RE.findall(text):
+        w = w.lower().replace("ё", "е").strip(".-")
+        if w:
+            out[w] += 1
+    return out
+
+
+def word_losses(
+    src: list[Replica], out: list[Replica], guesses: list[dict]
+) -> list[dict]:
+    """Реплики, из которых слова пропали без замены и без записи в `guesses`.
+
+    Зачем отдельно от verify_final: тот сверяет каркас, а выброшенная посреди
+    реплики фраза каркас не двигает и в дельте символов тонет (измерено: −20
+    слов живой речи при итоговой дельте −2.7%, где остальное — объявленное
+    сворачивание залипания). Проверка детерминированная, по мультимножеству
+    слов, и сознательно грубая: замена слова на слово даёт баланс и сюда не
+    попадает, свёрнутый повтор — тоже, если модель объявила его в `guesses`.
+
+    Предупреждение, а не гейт: выход уже записан, ретрай на этом не нужен —
+    список нужен глазам, чтобы решить, где смотреть исходник.
+    """
+    # Объявленная замена вычитается по количеству, объявленное сворачивание —
+    # по словам целиком: модель цитирует залипание обрывком («Dark Haus. Dark…
+    # 17+ повторов»), а в реплике их бывает вдвое больше, и счёт по вхождениям
+    # оставлял бы весь хвост повтора в отчёте как потерю.
+    declared: dict[str, Counter] = {}
+    collapsed: dict[str, set[str]] = {}
+    for g in guesses:
+        words = _words(g["from"])
+        if not g["to"].strip() or "залипан" in g["basis"].lower():
+            collapsed.setdefault(g["time"], set()).update(words)
+        else:
+            declared.setdefault(g["time"], Counter()).update(words)
+
+    reports = []
+    for s, o in zip(src, out):
+        lost = _words(s.text) - _words(o.text)
+        added = _words(o.text) - _words(s.text)
+        lost -= declared.get(s.time, Counter())
+        for w in collapsed.get(s.time, ()):
+            lost.pop(w, None)
+        net = sum(lost.values()) - sum(added.values())
+        if net > 0:
+            reports.append({"time": s.time, "net": net, "words": dict(lost)})
+    return reports
+
+
+def print_word_losses(reports: list[dict]) -> None:
+    """Нетто-баланс и список исчезнувшего — раздельно: часть исчезнувших слов
+    заменена (их компенсируют появившиеся), и «−1» рядом с четырьмя словами
+    читается как ошибка счёта, хотя это разные величины."""
+    if not reports:
+        return
+    total = sum(r["net"] for r in reports)
+    print(
+        f"\nпотеря слов без замены и без записи в догадках "
+        f"(реплик: {len(reports)}, нетто ~{total} слов):",
+        file=sys.stderr,
+    )
+    for r in reports:
+        items = sorted(r["words"].items(), key=lambda kv: (-kv[1], kv[0]))
+        shown = ", ".join(f"{w!r}×{n}" if n > 1 else repr(w) for w, n in items[:8])
+        if len(items) > 8:
+            shown += f", … (+{len(items) - 8})"
+        print(f"  [{r['time']}] нетто −{r['net']}; исчезли: {shown}", file=sys.stderr)
+    print(
+        "  сверить с исходником: сворачивание залипания объявляется в догадках, "
+        "эти реплики — нет",
+        file=sys.stderr,
+    )
 
 
 def verify_final(
@@ -710,6 +870,7 @@ def main() -> int:
         for r, text in zip(chunk, cleaned):
             cleaned_replicas.append(Replica(r.time, r.label, text.strip()))
     print_call_log()
+    print_guess_log()
     print(
         f"счётчик CLI: фаза 1 ${phase1_cost:.2f}, фаза 2 ${spent_usd() - phase1_cost:.2f}, "
         f"итого ${spent_usd():.2f} (list price; на подписке не списывается)",
@@ -725,6 +886,7 @@ def main() -> int:
         return 1
 
     out_path.write_text("\n\n".join(r.line() for r in cleaned_replicas) + "\n", encoding="utf-8")
+    print_word_losses(word_losses(src, cleaned_replicas, guess_log()))
     total_before = sum(len(r.text) for r in src)
     total_after = sum(len(r.text) for r in cleaned_replicas)
     print(

@@ -3,7 +3,8 @@
 
 Различает фазы по --model: sonnet → карта спикеров (SPEAKER_00 = Анна Соколова,
 SPEAKER_01 = Игорь Левин, остальные null — опоры address_reply по фикстуре
-meeting.txt), haiku → механические замены глоссария + точка в конец.
+meeting.txt), haiku → механические замены глоссария + точка в конец; замены из GUESSES
+дополнительно попадают в поле guesses (догадки без пары в контекст-файле).
 Формат envelope совпадает с реальным claude -p --output-format json.
 """
 import json
@@ -20,6 +21,13 @@ REPLACEMENTS = [
     ("паладин снимок", "Sentinel-2 снимок"),
     ("пайтера", "Python"),
     ("недобильному", "неделимому"),
+]
+
+
+# Замены, которых в фикстуре project-context.md нет: имитируют догадку по
+# контексту, о которой модель обязана отчитаться в guesses.
+GUESSES = [
+    ("сентинел-данные", "Sentinel-2-данные", "название спутника, пары в контекст-файле нет"),
 ]
 
 
@@ -50,14 +58,19 @@ def main() -> int:
         }
     else:
         cleaned = []
+        guesses = []
         for r in payload["replicas"]:
             t = r["text"]
             for a, b in REPLACEMENTS:
                 t = t.replace(a, b)
+            for a, b, basis in GUESSES:
+                if a in t:
+                    t = t.replace(a, b)
+                    guesses.append({"n": r["n"], "from": a, "to": b, "basis": basis})
             if t and t[-1] not in ".!?":
                 t += "."
             cleaned.append(t)
-        out = {"cleaned": cleaned}
+        out = {"cleaned": cleaned, "guesses": guesses}
 
     print(json.dumps({"is_error": False, "structured_output": out}, ensure_ascii=False))
     return 0

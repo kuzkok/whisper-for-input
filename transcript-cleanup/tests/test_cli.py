@@ -109,6 +109,19 @@ class CliTests(unittest.TestCase):
         self.assertIn("Горелый", text)  # спорная пара — не тронута
         self.assertIn("Sentinel-2", text)
 
+    def test_guess_log_reaches_stderr(self):
+        """Догадка мока проходит весь путь: ответ модели → журнал → stderr, и
+        применяется к тексту, хотя пары в контекст-файле для неё нет."""
+        proc = self.run_script(str(self.src), str(self.ctx),
+                               "-o", str(self.out), "--yes")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("догадки без пары в контекст-файле", proc.stderr)
+        self.assertIn("'сентинел-данные' → 'Sentinel-2-данные'", proc.stderr)
+        self.assertIn("название спутника", proc.stderr)
+        text = self.out.read_text()
+        self.assertIn("Sentinel-2-данные", text)
+        self.assertNotIn("сентинел-данные", text)
+
     def test_refuses_overwrite(self):
         self.out.write_text("старый выход\n")
         proc = self.run_script(str(self.src), str(self.ctx),

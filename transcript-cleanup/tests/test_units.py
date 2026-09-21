@@ -1,6 +1,7 @@
 """Юнит-тесты чистых функций cleanup_transcript (без вызовов claude -p)."""
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 import sys
@@ -469,6 +470,150 @@ class CostCounterTests(unittest.TestCase):
             out = ct.call_claude("sys", "user", "haiku", ct.SCHEMA_CLEAN, 10, "1.00")
         self.assertEqual(out, {"cleaned": ["текст"]})
         self.assertEqual(ct.spent_usd(), before)
+
+
+class GuessLogTests(unittest.TestCase):
+    """Журнал догадок: замены без пары в контекст-файле, о которых отчиталась модель."""
+
+    def chunk(self):
+        return [
+            ct.Replica("00:01:00", "Анна Соколова", "первая"),
+            ct.Replica("00:02:00", "Игорь Левин", "вторая"),
+        ]
+
+    def test_records_with_timecode_of_replica(self):
+        before = len(ct.guess_log())
+        ct.record_guesses(
+            [{"n": 2, "from": "Dark Haus", "to": "Darkhouse", "basis": "название платформы"}],
+            self.chunk(), "чанк 1/1",
+        )
+        rows = ct.guess_log()
+        self.assertEqual(len(rows), before + 1)
+        self.assertEqual(rows[-1]["time"], "00:02:00")
+        self.assertEqual(rows[-1]["from"], "Dark Haus")
+        self.assertEqual(rows[-1]["to"], "Darkhouse")
+
+    def test_skips_number_outside_chunk(self):
+        """Догадка с битым n не валит уже очищенный чанк — она отчётность, не выход."""
+        before = len(ct.guess_log())
+        ct.record_guesses(
+            [{"n": 9, "from": "a", "to": "b", "basis": "c"},
+             {"n": 0, "from": "a", "to": "b", "basis": "c"}],
+            self.chunk(), "чанк 1/1",
+        )
+        self.assertEqual(len(ct.guess_log()), before)
+
+    def test_ignores_missing_or_malformed_field(self):
+        before = len(ct.guess_log())
+        ct.record_guesses(None, self.chunk(), "чанк 1/1")
+        ct.record_guesses("не массив", self.chunk(), "чанк 1/1")
+        ct.record_guesses(["строка вместо объекта"], self.chunk(), "чанк 1/1")
+        self.assertEqual(len(ct.guess_log()), before)
+
+    def test_print_groups_by_pair_with_counts(self):
+        ct.record_guesses(
+            [{"n": 1, "from": "есед", "to": "СЭД", "basis": "аббревиатура со слуха"},
+             {"n": 2, "from": "есед", "to": "СЭД", "basis": "аббревиатура со слуха"},
+             {"n": 1, "from": "Дарк Хаус", "to": "Darkhouse", "basis": "название платформы"}],
+            self.chunk(), "чанк 1/1",
+        )
+        buf = io.StringIO()
+        with mock.patch.object(ct.sys, "stderr", buf):
+            ct.print_guess_log()
+        out = buf.getvalue()
+        self.assertIn("догадки без пары в контекст-файле", out)
+        self.assertIn("'есед' → 'СЭД'  ×2", out)
+        self.assertIn("00:01:00", out)
+        self.assertIn("аббревиатура со слуха", out)
+
+    def test_retry_does_not_duplicate_guesses(self):
+        """Догадки пишутся после проверок: запись неудачной попытки в журнал не попадает."""
+        chunk = self.chunk()
+        guess = [{"n": 1, "from": "a", "to": "b", "basis": "c"}]
+        answers = [
+            {"cleaned": ["одна строка вместо двух"], "guesses": guess},
+            {"cleaned": ["первая", "вторая"], "guesses": guess},
+        ]
+        before = len(ct.guess_log())
+        with mock.patch.object(ct, "call_claude", side_effect=answers):
+            out = ct.clean_chunk("prompt", chunk, "", "ctx", "label")
+        self.assertEqual(out, ["первая", "вторая"])
+        self.assertEqual(len(ct.guess_log()), before + 1)
+
+
+class WordLossTests(unittest.TestCase):
+    """Потеря слов внутри реплики: каркас цел, дельта символов молчит."""
+
+    def pair(self, src_text, out_text):
+        return ([ct.Replica("00:01:00", "Анна Соколова", src_text)],
+                [ct.Replica("00:01:00", "Анна Соколова", out_text)])
+
+    def test_reports_dropped_phrase(self):
+        src, out = self.pair(
+            "нам от того что этот лес это участок с лесом ни жарко ни холодно надо решить",
+            "нам надо решить",
+        )
+        rep = ct.word_losses(src, out, [])
+        self.assertEqual(len(rep), 1)
+        self.assertEqual(rep[0]["time"], "00:01:00")
+        self.assertEqual(rep[0]["net"], 13)
+        self.assertIn("жарко", rep[0]["words"])
+
+    def test_replacement_is_not_a_loss(self):
+        """Замена слова на слово даёт баланс и в отчёт не идёт."""
+        src, out = self.pair("подняли сервис в кувере", "подняли сервис в Kubernetes")
+        self.assertEqual(ct.word_losses(src, out, []), [])
+
+    def test_case_and_yo_are_not_losses(self):
+        src, out = self.pair("все упало и еще раз", "Всё упало и ещё раз")
+        self.assertEqual(ct.word_losses(src, out, []), [])
+
+    def test_declared_collapse_is_not_a_loss(self):
+        """Свёрнутое залипание объявлено в guesses — молчим."""
+        src, out = self.pair("платформа Dark Haus Dark Dark Dark Dark вроде",
+                             "платформа Darkhouse вроде")
+        guesses = [{"time": "00:01:00", "from": "Dark Haus Dark Dark Dark Dark",
+                    "to": "Darkhouse", "basis": "залипание, 5 повторов"}]
+        self.assertEqual(ct.word_losses(src, out, guesses), [])
+
+    def test_undeclared_collapse_is_reported(self):
+        """То же сворачивание без записи в guesses — в отчёт."""
+        src, out = self.pair("платформа Dark Haus Dark Dark Dark Dark вроде",
+                             "платформа Darkhouse вроде")
+        rep = ct.word_losses(src, out, [])
+        self.assertEqual(len(rep), 1)
+        self.assertIn("dark", rep[0]["words"])
+
+    def test_print_lists_timecode_and_words(self):
+        buf = io.StringIO()
+        with mock.patch.object(ct.sys, "stderr", buf):
+            ct.print_word_losses([{"time": "00:02:00", "net": 2, "words": {"смотрите": 1, "вот": 2}}])
+        out = buf.getvalue()
+        self.assertIn("00:02:00", out)
+        self.assertIn("'смотрите'", out)
+        self.assertIn("потеря слов", out)
+
+    def test_print_silent_when_nothing_lost(self):
+        buf = io.StringIO()
+        with mock.patch.object(ct.sys, "stderr", buf):
+            ct.print_word_losses([])
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_collapse_declared_by_excerpt_covers_whole_repeat(self):
+        """Модель цитирует залипание обрывком — хвост повтора не считается потерей."""
+        src, out = self.pair("вот " + "Dark " * 20 + "вроде", "вот Darkhouse вроде")
+        guesses = [{"time": "00:01:00", "from": "Dark Dark Dark", "to": "Darkhouse",
+                    "basis": "залипание, 20+ повторов"}]
+        self.assertEqual(ct.word_losses(src, out, guesses), [])
+
+    def test_declared_replacement_still_counts_by_occurrence(self):
+        """Обычная догадка вычитается по количеству, а не по словам целиком."""
+        src, out = self.pair("есед есед есед поднят", "СЭД поднят")
+        guesses = [{"time": "00:01:00", "from": "есед", "to": "СЭД",
+                    "basis": "аббревиатура со слуха"}]
+        rep = ct.word_losses(src, out, guesses)
+        self.assertEqual(len(rep), 1)
+        self.assertEqual(rep[0]["words"], {"есед": 2})
 
 
 if __name__ == "__main__":
