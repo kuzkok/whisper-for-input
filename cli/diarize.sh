@@ -9,11 +9,15 @@
 #   ./diarize.sh --prompt "Ретро-встреча команды" call.mp3
 #   ./diarize.sh --prompt-file gloss.txt --hotwords "Kubernetes Prometheus" call.mp3
 #   ./diarize.sh --prompt-file gloss.txt --hotwords-file terms.txt call.mp3
+#   ./diarize.sh --words call.mp3          # сырой JSON со словами
 #
 # --prompt / --prompt-file — ASR-подсказка (initial_prompt) строкой или из
 #   файла: короткая строка с ключевыми терминами (~200 токенов), не глоссарий.
 # --hotwords / --hotwords-file — ключевые слова через пробел или из файла
 #   (по слову на строку); на термины действует сильнее промпта.
+# --words — вместо готового текста сохраняет сырой JSON (<input>.words.json)
+#   с сегментами и словами: у каждого слова своя метка спикера. Нужен для
+#   замеров сегментации, читаемый транскрипт из него не получается.
 
 set -euo pipefail
 
@@ -27,9 +31,10 @@ PROMPT_TEXT=""
 PROMPT_FILE=""
 HOTWORDS=""
 HOTWORDS_FILE=""
+WORDS=0
 
 usage() {
-    sed -n '2,16p' "$0" | sed 's/^# \?//'
+    sed -n '2,20p' "$0" | sed 's/^# \?//'
     exit "${1:-0}"
 }
 
@@ -44,6 +49,7 @@ while [[ $# -gt 0 ]]; do
         --prompt-file)     PROMPT_FILE="$2"; shift 2 ;;
         --hotwords)        HOTWORDS="$2"; shift 2 ;;
         --hotwords-file)   HOTWORDS_FILE="$2"; shift 2 ;;
+        --words)           WORDS=1; shift ;;
         -h|--help)         usage 0 ;;
         -*)                echo "unknown option: $1" >&2; usage 1 ;;
         *)
@@ -80,7 +86,11 @@ if [[ -n "$HOTWORDS" && -n "$HOTWORDS_FILE" ]]; then
     exit 1
 fi
 if [[ -z "$OUTPUT" ]]; then
-    OUTPUT="${INPUT%.*}.txt"
+    if [[ "$WORDS" -eq 1 ]]; then
+        OUTPUT="${INPUT%.*}.words.json"
+    else
+        OUTPUT="${INPUT%.*}.txt"
+    fi
 fi
 
 # Подсказки уходят в запрос только если заданы: без флагов тело запроса
@@ -107,6 +117,16 @@ if [[ -n "$HOTWORDS" ]]; then
     EXTRA_LOG+=" hotwords=${HOTWORDS}"
 fi
 
+# В режиме --words ответ сохраняется как есть: это вход для скриптов-замеров,
+# а не для чтения человеком.
+if [[ "$WORDS" -eq 1 ]]; then
+    FORMAT="json"
+    EXTRA_ARGS+=(-F "include_words=true")
+    EXTRA_LOG+=" words=1"
+else
+    FORMAT="text"
+fi
+
 echo "→ POST $URL/diarize  file=$INPUT lang=${LANG:-auto}${EXTRA_LOG}" >&2
 
 # --form-string для подсказок: в отличие от -F, значение никогда не трактуется
@@ -116,9 +136,11 @@ curl --fail-with-body -sS -X POST "$URL/diarize" \
     -F "language=${LANG}" \
     -F "min_speakers=${MIN_SPEAKERS}" \
     -F "max_speakers=${MAX_SPEAKERS}" \
-    -F "format=text" \
+    -F "format=${FORMAT}" \
     "${EXTRA_ARGS[@]}" \
-  | python3 -c 'import json, sys; print(json.load(sys.stdin)["text"])' \
+  | if [[ "$WORDS" -eq 1 ]]; then cat; else
+        python3 -c 'import json, sys; print(json.load(sys.stdin)["text"])'
+    fi \
   > "$OUTPUT"
 
 echo "✔ $OUTPUT" >&2

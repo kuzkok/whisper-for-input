@@ -100,11 +100,48 @@ def patched_server(monkeypatch):
     # фиксирует значения на момент вызова.
 
     # Сегменты после assign_word_speakers — теперь со speaker label.
+    # Слова несут собственные метки (поле word["speaker"] из assign_word_speakers).
+    # Первый сегмент намеренно смешанный: доминирующий спикер SPEAKER_00, но
+    # последнее слово принадлежит SPEAKER_01 — ровно тот случай, который
+    # segment-level сборка теряет.
     spoken_segments = [
-        {"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00", "text": "привет"},
-        {"start": 1.0, "end": 1.5, "speaker": "SPEAKER_00", "text": "мир"},
-        {"start": 1.5, "end": 2.5, "speaker": "SPEAKER_01", "text": "ответ"},
-        {"start": 2.5, "end": 3.0, "speaker": "SPEAKER_00", "text": "снова"},
+        {
+            "start": 0.0,
+            "end": 1.0,
+            "speaker": "SPEAKER_00",
+            "text": "привет",
+            "words": [
+                {"word": "при", "start": 0.0, "end": 0.5, "score": 0.9, "speaker": "SPEAKER_00"},
+                {"word": "вет", "start": 0.6, "end": 1.0, "score": 0.8, "speaker": "SPEAKER_01"},
+            ],
+        },
+        {
+            "start": 1.0,
+            "end": 1.5,
+            "speaker": "SPEAKER_00",
+            "text": "мир",
+            "words": [
+                {"word": "мир", "start": 1.0, "end": 1.5, "score": 0.7, "speaker": "SPEAKER_00"},
+            ],
+        },
+        {
+            "start": 1.5,
+            "end": 2.5,
+            "speaker": "SPEAKER_01",
+            "text": "ответ",
+            "words": [
+                {"word": "ответ", "start": 1.5, "end": 2.5, "score": 0.6, "speaker": "SPEAKER_01"},
+            ],
+        },
+        {
+            "start": 2.5,
+            "end": 3.0,
+            "speaker": "SPEAKER_00",
+            "text": "снова",
+            "words": [
+                {"word": "снова", "start": 2.5, "end": 3.0, "score": 0.5, "speaker": "SPEAKER_00"},
+            ],
+        },
     ]
 
     fake_diarize = _FakeDiarizePipeline()
@@ -570,3 +607,204 @@ def test_diarize_pipeline_cached_across_requests(patched_server):
     # DiarizationPipeline должен быть вызван ровно один раз — get_diarize_pipeline
     # кэширует в _diarize_pipeline.
     assert len(patched_server.diarize_calls) == 1
+
+
+# ── /diarize include_words: word-level выход ───────────────────────────────
+
+
+def test_diarize_json_has_no_words_without_flag(patched_server):
+    """Контракт по умолчанию не меняется: words отдаются только по запросу,
+    иначе ответ на длинной записи распухает на порядок."""
+    resp = patched_server.client.post(
+        "/diarize",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={"language": "ru", "format": "json"},
+    )
+    assert resp.status_code == 200
+    for seg in resp.json()["segments"]:
+        assert "words" not in seg
+
+
+def test_diarize_include_words_returns_word_level_speakers(patched_server):
+    """include_words=true — у каждого сегмента полный список слов со своими
+    метками. Первый сегмент смешанный: SPEAKER_00 + SPEAKER_01 внутри одного
+    сегмента, чья метка SPEAKER_00."""
+    resp = patched_server.client.post(
+        "/diarize",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={"language": "ru", "format": "json", "include_words": "true"},
+    )
+    assert resp.status_code == 200
+    segments = resp.json()["segments"]
+    first = segments[0]
+    assert set(first.keys()) == {"start", "end", "speaker", "text", "words"}
+    assert [w["word"] for w in first["words"]] == ["при", "вет"]
+    assert [w["speaker"] for w in first["words"]] == ["SPEAKER_00", "SPEAKER_01"]
+    assert first["words"][0] == {
+        "word": "при",
+        "start": 0.0,
+        "end": 0.5,
+        "score": 0.9,
+        "speaker": "SPEAKER_00",
+    }
+
+
+def test_diarize_include_words_keeps_missing_speaker_as_none(monkeypatch, patched_server):
+    """Слово без пересечения с диаризацией (fill_nearest=False) приходит без
+    ключа speaker. Отдаём None, а не UNKNOWN: для метрик «метки нет» и «метка
+    такая-то» — разные случаи, а UNKNOWN — валидное значение уровня сегмента."""
+    monkeypatch.setattr(
+        patched_server.module.whisperx,
+        "assign_word_speakers",
+        lambda d, t: {
+            "segments": [
+                {
+                    "start": 0.0,
+                    "end": 1.0,
+                    "speaker": "SPEAKER_00",
+                    "text": "тишина",
+                    "words": [{"word": "тишина", "start": 0.0, "end": 1.0, "score": 0.4}],
+                }
+            ]
+        },
+    )
+    resp = patched_server.client.post(
+        "/diarize",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={"language": "ru", "format": "json", "include_words": "true"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["segments"][0]["words"][0]["speaker"] is None
+
+
+def test_diarize_include_words_tolerates_unaligned_word(monkeypatch, patched_server):
+    """У слов, которые wav2vec2 не выровнял (цифры, символы), нет start/end/score.
+    Такое слово не должно ронять ответ — отдаём None в таймингах."""
+    monkeypatch.setattr(
+        patched_server.module.whisperx,
+        "assign_word_speakers",
+        lambda d, t: {
+            "segments": [
+                {
+                    "start": 0.0,
+                    "end": 1.0,
+                    "speaker": "SPEAKER_00",
+                    "text": "15",
+                    "words": [{"word": "15"}],
+                }
+            ]
+        },
+    )
+    resp = patched_server.client.post(
+        "/diarize",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={"language": "ru", "format": "json", "include_words": "true"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["segments"][0]["words"][0] == {
+        "word": "15",
+        "start": None,
+        "end": None,
+        "score": None,
+        "speaker": None,
+    }
+
+
+def test_diarize_include_words_segment_without_words_key(monkeypatch, patched_server):
+    """Сегмент без ключа words (выравнивание ничего не вернуло) → пустой список,
+    а не KeyError."""
+    monkeypatch.setattr(
+        patched_server.module.whisperx,
+        "assign_word_speakers",
+        lambda d, t: {"segments": [{"start": 0.0, "end": 1.0, "speaker": "SPEAKER_00", "text": "..."}]},
+    )
+    resp = patched_server.client.post(
+        "/diarize",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={"language": "ru", "format": "json", "include_words": "true"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["segments"][0]["words"] == []
+
+
+def test_diarize_include_words_ignored_for_format_text(patched_server):
+    """format=text отдаёт строки, места под слова там нет: флаг молча не влияет
+    на форму ответа."""
+    resp = patched_server.client.post(
+        "/diarize",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={"language": "ru", "format": "text", "include_words": "true"},
+    )
+    assert resp.status_code == 200
+    assert set(resp.json().keys()) == {"language", "text"}
+
+
+# ── /diarize: разрез сегментов по word-level спикерам ──────────────────────
+
+
+def _two_speaker_segment():
+    """Один VAD-сегмент, накрывший вопрос одного участника и ответ другого.
+
+    Реплика каждого длиннее порога дребезга: метки первых слов реплики
+    whisperx путает регулярно, и разрез рассчитан на уверенные куски."""
+    words = [
+        {"word": "А", "start": 0.0, "end": 0.2, "score": 0.9, "speaker": "SPEAKER_00"},
+        {"word": "доступ", "start": 0.2, "end": 0.6, "score": 0.9, "speaker": "SPEAKER_00"},
+        {"word": "в", "start": 0.6, "end": 0.7, "score": 0.9, "speaker": "SPEAKER_00"},
+        {"word": "репозиторий", "start": 0.7, "end": 1.2, "score": 0.9, "speaker": "SPEAKER_00"},
+        {"word": "все", "start": 1.2, "end": 1.4, "score": 0.9, "speaker": "SPEAKER_00"},
+        {"word": "получили?", "start": 1.4, "end": 1.9, "score": 0.9, "speaker": "SPEAKER_00"},
+        {"word": "Пока", "start": 2.0, "end": 2.3, "score": 0.9, "speaker": "SPEAKER_01"},
+        {"word": "нет,", "start": 2.3, "end": 2.6, "score": 0.9, "speaker": "SPEAKER_01"},
+        {"word": "заявка", "start": 2.6, "end": 3.0, "score": 0.9, "speaker": "SPEAKER_01"},
+        {"word": "ещё", "start": 3.0, "end": 3.3, "score": 0.9, "speaker": "SPEAKER_01"},
+        {"word": "в", "start": 3.3, "end": 3.4, "score": 0.9, "speaker": "SPEAKER_01"},
+        {"word": "работе.", "start": 3.4, "end": 3.9, "score": 0.9, "speaker": "SPEAKER_01"},
+    ]
+    return {
+        "start": 0.0,
+        "end": 3.9,
+        "speaker": "SPEAKER_01",  # доминирующий по времени — ему ушёл бы весь сегмент
+        "text": " ".join(w["word"] for w in words),
+        "words": words,
+    }
+
+
+def test_diarize_splits_segment_with_two_speakers(monkeypatch, patched_server):
+    """Ключевой случай задачи: вопрос и ответ в одном VAD-сегменте должны стать
+    двумя сегментами с разными метками, а не одним под меткой доминирующего."""
+    monkeypatch.setattr(
+        patched_server.module.whisperx,
+        "assign_word_speakers",
+        lambda d, t: {"segments": [_two_speaker_segment()]},
+    )
+    resp = patched_server.client.post(
+        "/diarize",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={"language": "ru", "format": "json"},
+    )
+    assert resp.status_code == 200
+    segments = resp.json()["segments"]
+    assert [s["speaker"] for s in segments] == ["SPEAKER_00", "SPEAKER_01"]
+    assert segments[0]["text"] == "А доступ в репозиторий все получили?"
+    assert segments[1]["text"] == "Пока нет, заявка ещё в работе."
+
+
+def test_diarize_text_shows_two_replicas_after_split(monkeypatch, patched_server):
+    """То же в format=text: две реплики вместо одной слипшейся."""
+    monkeypatch.setattr(
+        patched_server.module.whisperx,
+        "assign_word_speakers",
+        lambda d, t: {"segments": [_two_speaker_segment()]},
+    )
+    resp = patched_server.client.post(
+        "/diarize",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={"language": "ru", "format": "text"},
+    )
+    assert resp.status_code == 200
+    lines = resp.json()["text"].split("\n\n")
+    assert lines == [
+        "[00:00:00] [SPEAKER_00] А доступ в репозиторий все получили?",
+        "[00:00:02] [SPEAKER_01] Пока нет, заявка ещё в работе.",
+    ]

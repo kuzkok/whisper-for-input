@@ -22,6 +22,8 @@ from fastapi.responses import JSONResponse
 # а не лениво на первом /diarize.
 from whisperx.diarize import DiarizationPipeline
 
+from speaker_split import split_segments
+
 MODEL_NAME = os.environ.get("WHISPER_MODEL", "large-v3-turbo")
 DEVICE = os.environ.get("WHISPER_DEVICE", "cuda")
 COMPUTE_TYPE = os.environ.get("WHISPER_COMPUTE_TYPE", "int8_float16")
@@ -149,6 +151,25 @@ def _format_ts(seconds: float) -> str:
     return f"{h:02d}:{m:02d}:{s:02d}"
 
 
+def _word_payload(word):
+    """Одно слово из выхода assign_word_speakers для include_words.
+
+    Отсутствующие поля отдаём как None, а не подставляем значения:
+    - start/end/score нет у слов, которые wav2vec2 не выровнял (цифры, символы);
+    - speaker нет, когда слово не пересеклось ни с одним интервалом диаризации
+      (fill_nearest=False по умолчанию, whisperx/diarize.py:189).
+    Для метрик сегментации «метки нет» и «метка такая-то» — разные случаи,
+    поэтому UNKNOWN уровня сегмента сюда не переносится.
+    """
+    return {
+        "word": word.get("word", ""),
+        "start": float(word["start"]) if word.get("start") is not None else None,
+        "end": float(word["end"]) if word.get("end") is not None else None,
+        "score": float(word["score"]) if word.get("score") is not None else None,
+        "speaker": word.get("speaker"),
+    }
+
+
 def _set_asr_hints(initial_prompt, hotwords):
     """Per-request мутация ASR-подсказок в _model.options.
 
@@ -206,12 +227,23 @@ def diarize(
     format: str = Form("json"),
     initial_prompt: str = Form(""),
     hotwords: str = Form(""),
+    include_words: bool = Form(False),
 ):
     """Full WhisperX pipeline: ASR + word alignment + speaker diarization.
 
     format=json  → {"language": "...", "segments": [{start, end, speaker, text}, ...]}
     format=text  → {"language": "...",
                      "text": "[00:01:23] [SPEAKER_00] ...\n\n[00:05:41] [SPEAKER_01] ..."}
+
+    include_words=true добавляет каждому сегменту поле words со словами и их
+    собственными метками спикера. Метка сегмента — доминирующая по пересечению
+    с диаризацией (whisperx/diarize.py:229), поэтому речь второго говорящего
+    внутри одного VAD-сегмента в ней не видна, а на уровне слов — видна. Флаг
+    нужен, чтобы это рассогласование можно было измерить снаружи, не переделывая
+    сборку реплик. По умолчанию выключен: на записи в десятки минут слова
+    раздувают ответ на порядок, а потребителям (/diarize в CLI, transcript-cleanup)
+    они не нужны. Действует только на format=json — в строках format=text места
+    под слова нет.
 
     Глобальный INITIAL_PROMPT здесь НЕ используется: эндпоинт обслуживает
     произвольные встречи/видео, и русская подсказка про разработчика загнала бы
@@ -278,15 +310,22 @@ def diarize(
             torch.cuda.empty_cache()
         os.unlink(tmp_path)
 
-    segments = [
-        {
+    # Сегмент, накрывший речь двух человек, whisperx отдаёт целиком доминирующему,
+    # а word-level разметку выбрасывает. Режем его обратно по меткам слов — иначе
+    # вопрос одного участника оказывается внутри реплики другого (см. speaker_split).
+    spoken = split_segments(result["segments"])
+
+    segments = []
+    for seg in spoken:
+        item = {
             "start": float(seg["start"]),
             "end": float(seg["end"]),
             "speaker": seg.get("speaker", "UNKNOWN"),
             "text": seg["text"].strip(),
         }
-        for seg in result["segments"]
-    ]
+        if include_words:
+            item["words"] = [_word_payload(w) for w in seg.get("words", [])]
+        segments.append(item)
 
     if format == "text":
         lines = []
