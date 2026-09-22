@@ -57,7 +57,7 @@ ENV NLTK_DATA=/home/whisper/nltk_data
 RUN python -m nltk.downloader -d "$NLTK_DATA" punkt_tab && \
         rm -f "$NLTK_DATA/tokenizers/punkt_tab.zip"
 
-COPY --chown=whisper:whisper server.py .
+COPY --chown=whisper:whisper server.py speaker_split.py ./
 
 EXPOSE 8000
 
