@@ -1,7 +1,7 @@
 services:
   whisper:
     build: .
-    image: whisper-for-input:20260922.1
+    image: whisper-for-input:20260923.2
     restart: unless-stopped
     ports:
       - "127.0.0.1:8000:8000"
@@ -14,7 +14,7 @@ services:
     environment:
       - WHISPER_MODEL=dropbox-dash/faster-whisper-large-v3-turbo
       - WHISPER_DEVICE=cuda
-      - WHISPER_COMPUTE_TYPE=int8_float16
+      - WHISPER_COMPUTE_TYPE=float16   # см. CLAUDE.md: int8 давал галлюцинации
       - WHISPER_BATCH_SIZE=8   # см. CLAUDE.md: 16 не влезает в 6 ГБ VRAM
       - HF_HOME=/home/whisper/.cache/huggingface
       - HF_HUB_OFFLINE=1

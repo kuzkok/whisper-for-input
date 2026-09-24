@@ -14,7 +14,7 @@ After=network.target
 # Тег запинен намеренно: рестарт юнита не должен подхватывать случайно
 # пересобранный :latest. Значение держится в одном виде с docker-compose.yml,
 # бампится вручную при пересборке.
-Image=localhost/whisper-for-input:20260922.1
+Image=localhost/whisper-for-input:20260923.2
 PublishPort=127.0.0.1:8000:8000
 # Map the calling host user to the in-container `whisper` user
 # (UID/GID 5000). The mounted models/ and torch-cache/ dirs (owned by the
@@ -27,11 +27,17 @@ Volume=%h/.local/share/whisper-for-input/models:/home/whisper/.cache/huggingface
 Volume=%h/.local/share/whisper-for-input/torch-cache:/home/whisper/.cache/torch:z
 Environment=WHISPER_MODEL=dropbox-dash/faster-whisper-large-v3-turbo
 Environment=WHISPER_DEVICE=cuda
-Environment=WHISPER_COMPUTE_TYPE=int8_float16
+# float16, а не int8_float16: квантование подменяло целые чанки живого диалога
+# галлюцинацией из ютубовских субтитров (замер на записи 46 минут: 2 вхождения
+# против 0, глоссарных ошибок 5 против 4). Веса тяжелее на 928 MiB, и в /diarize
+# они снимаются с карты на время align+pyannote — см. _asr_weights_offloaded
+# в server.py; пик на той же записи 4711 MiB против 4655 у прежней конфигурации.
+Environment=WHISPER_COMPUTE_TYPE=float16
 # Подобран замером на RTX 3060 6 ГБ: батч добавляет ~230 МБ VRAM на единицу,
 # а ускоряет только ASR-фазу, которая в /diarize занимает считанные секунды из
 # минут. 16 упирается в потолок карты и падает с CUDA out of memory, как только
-# десктоп займёт свою часть VRAM. Подробности в CLAUDE.md.
+# на карте появится что-то ещё: резидентные модели самого сервиса или приложение,
+# запущенное на дискретной GPU. Подробности в CLAUDE.md.
 Environment=WHISPER_BATCH_SIZE=8
 Environment=HF_HOME=/home/whisper/.cache/huggingface
 # Models are pre-downloaded by ./download-models.sh on the host. No network or

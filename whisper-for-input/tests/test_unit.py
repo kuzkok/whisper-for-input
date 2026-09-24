@@ -45,6 +45,34 @@ class _FakeOptions:
     hotwords: str | None = None
 
 
+
+class _FakeCt2Model:
+    """Стаб ctranslate2.models.Whisper: из всего API — только выгрузка весов.
+
+    Настоящий объект лежит в _model.model.model (whisperx-пайплайн → faster_whisper
+    → CTranslate2) и держит веса ASR на карте всё время жизни процесса.
+    """
+
+    def __init__(self):
+        self.model_is_loaded = True
+        self.calls: list[tuple] = []
+
+    def unload_model(self, to_cpu=False):
+        self.calls.append(("unload", to_cpu))
+        self.model_is_loaded = False
+
+    def load_model(self):
+        self.calls.append(("load",))
+        self.model_is_loaded = True
+
+
+class _FakeWhisperModel:
+    """Стаб faster_whisper.WhisperModel — нужен только как держатель ct2-модели."""
+
+    def __init__(self):
+        self.model = _FakeCt2Model()
+
+
 class _FakeModel:
     """Стаб _model — записывает аргументы вызова и возвращает заранее заданное."""
 
@@ -53,6 +81,7 @@ class _FakeModel:
         self._language = language
         self.options = _FakeOptions()
         self.calls: list[dict[str, Any]] = []
+        self.model = _FakeWhisperModel()
 
     def transcribe(self, audio, batch_size, language):  # noqa: ARG002
         # Снапшот подсказок на момент вызова — эндпоинт обязан выставить их
@@ -69,14 +98,35 @@ class _FakeModel:
         return {"segments": self._segments, "language": self._language}
 
 
+class _FakeTorchModule:
+    """Стаб torch-модели (wav2vec2 выравнивания, pyannote Pipeline): только .to().
+
+    Помнит текущее устройство и историю переездов — по ним тесты проверяют, что
+    align/pyannote работают на GPU, а между запросами лежат на CPU.
+    """
+
+    def __init__(self, device):
+        self.device = str(device)
+        self.moves: list[str] = []
+
+    def to(self, device):
+        self.device = str(device)
+        self.moves.append(self.device)
+        return self
+
+
 class _FakeDiarizePipeline:
     def __init__(self, *args, **kwargs):
         self.init_args = args
         self.init_kwargs = kwargs
         self.calls: list[dict[str, Any]] = []
+        # whisperx.diarize.DiarizationPipeline держит pyannote Pipeline в .model.
+        self.model = _FakeTorchModule(kwargs.get("device", "cpu"))
+        self.devices_at_call: list[str] = []
 
     def __call__(self, audio, **kwargs):  # noqa: ARG002
         self.calls.append(kwargs)
+        self.devices_at_call.append(self.model.device)
         # Возвращаем что-то непустое, реальный assign_word_speakers замокан.
         return "FAKE_DIARIZATION_DF"
 
@@ -157,18 +207,20 @@ def patched_server(monkeypatch):
     monkeypatch.setattr(server, "_diarize_pipeline", None)
 
     monkeypatch.setattr(server.whisperx, "load_audio", lambda path: np.zeros(16000, dtype=np.float32))
-    monkeypatch.setattr(
-        server.whisperx,
-        "load_align_model",
-        lambda language_code, device: ("FAKE_ALIGN_MODEL", "FAKE_METADATA"),
-    )
-    monkeypatch.setattr(
-        server.whisperx,
-        "align",
-        lambda segments, model, metadata, audio, device, return_char_alignments: {
-            "segments": segments,
-        },
-    )
+    align_models = []
+
+    def fake_load_align_model(language_code, device):  # noqa: ARG001
+        align_models.append(_FakeTorchModule(device))
+        return align_models[-1], "FAKE_METADATA"
+
+    align_devices = []
+
+    def fake_align(segments, model, metadata, audio, device, return_char_alignments):  # noqa: ARG001
+        align_devices.append(model.device)
+        return {"segments": segments}
+
+    monkeypatch.setattr(server.whisperx, "load_align_model", fake_load_align_model)
+    monkeypatch.setattr(server.whisperx, "align", fake_align)
     monkeypatch.setattr(
         server.whisperx,
         "assign_word_speakers",
@@ -188,6 +240,8 @@ def patched_server(monkeypatch):
             "fake_diarize": fake_diarize,
             "diarize_calls": diarize_calls,
             "spoken_segments": spoken_segments,
+            "align_models": align_models,
+            "align_devices": align_devices,
         },
     )
 
@@ -236,14 +290,20 @@ def empty_cache_calls(monkeypatch):
 
 def test_diarize_calls_empty_cache_afterwards(empty_cache_calls, patched_server):
     """/diarize — тяжёлый запрос: арены align/pyannote возвращаются драйверу,
-    иначе повторный длинный /diarize падает с CUDA OOM (measured: 2,7 ГБ арен)."""
+    иначе повторный длинный /diarize падает с CUDA OOM (measured: 2,7 ГБ арен).
+
+    Вызовов два: первый — внутри offload-контекста, перед возвратом весов ASR
+    на карту, второй — в finally обработчика, он покрывает путь, где выгрузка
+    не состоялась (CPU-устройство, отсутствующий API CTranslate2) или запрос
+    упал ещё в ASR-фазе.
+    """
     resp = patched_server.client.post(
         "/diarize",
         files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
         data={"language": "ru"},
     )
     assert resp.status_code == 200
-    assert len(empty_cache_calls) == 1
+    assert len(empty_cache_calls) == 2
 
 
 def test_diarize_calls_empty_cache_even_when_pipeline_fails(empty_cache_calls, patched_server):
@@ -264,7 +324,9 @@ def test_diarize_calls_empty_cache_even_when_pipeline_fails(empty_cache_calls, p
     )
     monkeypatch.undo()
     assert resp.status_code == 500
-    assert len(empty_cache_calls) == 1
+    # Два вызова, как и на успешном пути: упавший align тоже проходит через
+    # finally offload-контекста (веса надо вернуть) и через finally обработчика.
+    assert len(empty_cache_calls) == 2
 
 
 def test_transcribe_does_not_call_empty_cache(empty_cache_calls, patched_server):
@@ -277,6 +339,185 @@ def test_transcribe_does_not_call_empty_cache(empty_cache_calls, patched_server)
     )
     assert resp.status_code == 200
     assert empty_cache_calls == []
+
+
+# ── /diarize: выгрузка весов ASR на время align + диаризации ───────────────
+
+
+def test_diarize_offloads_asr_weights_during_align_and_diarization(patched_server):
+    """Пик VRAM /diarize приходится на align+pyannote, где веса ASR только лежат.
+
+    Обе фазы обязаны идти с выгруженными весами, а к ответу веса должны
+    вернуться: следующий /transcribe не имеет права ждать их загрузки.
+    """
+    module = patched_server.module
+    ct2 = patched_server.fake_model.model.model
+    seen = []
+
+    def _align(segments, model, metadata, audio, device, return_char_alignments):  # noqa: ARG001
+        seen.append(("align", ct2.model_is_loaded))
+        return {"segments": segments}
+
+    def _pipe(audio, **kwargs):  # noqa: ARG001
+        seen.append(("diarize", ct2.model_is_loaded))
+        return "FAKE_DIARIZATION_DF"
+
+    _pipe.model = _FakeTorchModule("cuda")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(module.whisperx, "align", _align)
+    monkeypatch.setattr(module, "_diarize_pipeline", None)
+    monkeypatch.setattr(module, "DiarizationPipeline", lambda *a, **k: _pipe)
+
+    resp = patched_server.client.post(
+        "/diarize",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={"language": "ru"},
+    )
+    monkeypatch.undo()
+
+    assert resp.status_code == 200
+    assert seen == [("align", False), ("diarize", False)]
+    assert ct2.model_is_loaded is True
+    assert [c[0] for c in ct2.calls] == ["unload", "load"]
+
+
+def test_diarize_restores_asr_weights_when_pipeline_fails(patched_server):
+    """Упавший запрос не имеет права оставить сервер без весов ASR:
+    следующий /transcribe (hot path voice-input) должен работать сразу."""
+    ct2 = patched_server.fake_model.model.model
+
+    def _boom(*args, **kwargs):
+        raise RuntimeError("CUDA failed with error out of memory")
+
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(patched_server.module.whisperx, "align", _boom)
+    client = TestClient(patched_server.module.app, raise_server_exceptions=False)
+    resp = client.post(
+        "/diarize",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={"language": "ru"},
+    )
+    monkeypatch.undo()
+
+    assert resp.status_code == 500
+    assert ct2.model_is_loaded is True
+    assert [c[0] for c in ct2.calls] == ["unload", "load"]
+
+
+def test_diarize_frees_torch_arenas_before_reloading_asr_weights(monkeypatch, patched_server):
+    """Веса возвращаются в ту же память, где только что были арены align/pyannote.
+
+    Без предварительного empty_cache load_model падает с CUDA OOM (measured:
+    torch держал 4478 MiB из 5804, весам нужно ~2250) — и запрос, дошедший до
+    конца пайплайна, всё равно отвечает 500.
+    """
+    events = []
+    monkeypatch.setattr("torch.cuda.is_initialized", lambda: True)
+    monkeypatch.setattr("torch.cuda.empty_cache", lambda: events.append("empty_cache"))
+
+    ct2 = patched_server.fake_model.model.model
+    orig_load = ct2.load_model
+
+    def _load():
+        events.append("load_model")
+        orig_load()
+
+    monkeypatch.setattr(ct2, "load_model", _load)
+
+    resp = patched_server.client.post(
+        "/diarize",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={"language": "ru"},
+    )
+    assert resp.status_code == 200
+    assert events.index("empty_cache") < events.index("load_model")
+
+
+# ── /diarize: align + pyannote живут на CPU между запросами ────────────────
+
+
+def _post_diarize(client):
+    return client.post(
+        "/diarize",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={"language": "ru"},
+    )
+
+
+def test_diarize_parks_align_and_pyannote_on_cpu_after_request(patched_server):
+    """Выгрузка весов ASR — зеркальная половина. Вторая: align (wav2vec2) и
+    pyannote, оставшись на карте после первого /diarize, отнимали ~1,2 ГБ у
+    ASR-фазы следующего запроса, и под float16 он падал с CUDA OOM на encode
+    первого батча. Работают они на GPU, а между запросами лежат на CPU."""
+    for _ in range(2):
+        assert _post_diarize(patched_server.client).status_code == 200
+
+    align_model = patched_server.align_models[0]
+    pipeline = patched_server.fake_diarize
+    assert patched_server.align_devices == ["cuda", "cuda"]
+    assert pipeline.devices_at_call == ["cuda", "cuda"]
+    assert align_model.device == "cpu"
+    assert pipeline.model.device == "cpu"
+
+
+def test_diarize_parks_align_and_pyannote_when_pipeline_fails(patched_server):
+    """Упавший запрос (например, OOM внутри pyannote) тоже обязан увезти модели
+    с карты — иначе следующий /diarize упадёт уже на ASR-фазе."""
+    monkeypatch = pytest.MonkeyPatch()
+
+    def _boom(self, audio, **kwargs):  # noqa: ARG001
+        raise RuntimeError("CUDA failed with error out of memory")
+
+    monkeypatch.setattr(_FakeDiarizePipeline, "__call__", _boom)
+    client = TestClient(patched_server.module.app, raise_server_exceptions=False)
+    resp = _post_diarize(client)
+    monkeypatch.undo()
+
+    assert resp.status_code == 500
+    assert patched_server.align_models[0].device == "cpu"
+    assert patched_server.fake_diarize.model.device == "cpu"
+
+
+def test_diarize_parks_models_before_reloading_asr_weights(monkeypatch, patched_server):
+    """Веса ASR возвращаются на карту после того, как align/pyannote с неё
+    съехали: иначе load_model делит память с их ~1,2 ГБ."""
+    ct2 = patched_server.fake_model.model.model
+    orig_load = ct2.load_model
+    devices_at_reload = []
+
+    def _load():
+        devices_at_reload.append(
+            (patched_server.align_models[0].device, patched_server.fake_diarize.model.device)
+        )
+        orig_load()
+
+    monkeypatch.setattr(ct2, "load_model", _load)
+    assert _post_diarize(patched_server.client).status_code == 200
+    assert devices_at_reload == [("cpu", "cpu")]
+
+
+def test_diarize_models_stay_put_on_cpu_device(monkeypatch, patched_server):
+    """WHISPER_DEVICE=cpu: переезжать некуда, модели всё время на CPU."""
+    monkeypatch.setattr(patched_server.module, "DEVICE", "cpu")
+    assert _post_diarize(patched_server.client).status_code == 200
+    assert set(patched_server.align_models[0].moves) <= {"cpu"}
+    assert set(patched_server.fake_diarize.model.moves) <= {"cpu"}
+    assert patched_server.align_devices == ["cpu"]
+
+
+def test_transcribe_does_not_offload_asr_weights(patched_server):
+    """/transcribe — hot path: выгрузка-загрузка на каждую диктовку стоила бы
+    секунд на ровном месте, а align/pyannote здесь не работают."""
+    ct2 = patched_server.fake_model.model.model
+    resp = patched_server.client.post(
+        "/transcribe",
+        files={"file": ("audio.wav", _silence_wav_bytes(), "audio/wav")},
+        data={"language": "ru"},
+    )
+    assert resp.status_code == 200
+    assert ct2.calls == []
+    assert ct2.model_is_loaded is True
 
 
 # ── /transcribe ─────────────────────────────────────────────────────────────

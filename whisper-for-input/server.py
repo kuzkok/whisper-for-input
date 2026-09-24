@@ -10,7 +10,7 @@ import dataclasses
 import os
 import tempfile
 import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 
 import nltk
 import torch
@@ -77,14 +77,21 @@ def _disable_nltk_download():
 
 
 def get_align_model(lang_code):
+    """Модель выравнивания для языка, уже на DEVICE.
+
+    Между запросами модели лежат на CPU (см. _diarize_models_parked), поэтому
+    закэшированную модель поднимаем на карту при каждой выдаче; для свежей
+    загрузки .to() — no-op.
+    """
     if lang_code not in _align_models:
         print(f"Loading alignment model for language '{lang_code}'...", flush=True)
         align_model, metadata = whisperx.load_align_model(language_code=lang_code, device=DEVICE)
         _align_models[lang_code] = (align_model, metadata)
-    return _align_models[lang_code]
+    align_model, metadata = _align_models[lang_code]
+    return align_model.to(torch.device(DEVICE)), metadata
 
 
-def get_diarize_pipeline():
+def _load_diarize_pipeline():
     global _diarize_pipeline
     if _diarize_pipeline is None:
         print("Loading pyannote diarization pipeline...", flush=True)
@@ -98,6 +105,28 @@ def get_diarize_pipeline():
         )
         print("Diarization pipeline ready.", flush=True)
     return _diarize_pipeline
+
+
+def get_diarize_pipeline():
+    """Пайплайн pyannote, уже на DEVICE (между запросами он на CPU, как и align).
+
+    .model — pyannote Pipeline внутри обёртки whisperx; его .to() переносит все
+    подмодели (segmentation, embedding) и принимает только torch.device.
+    """
+    pipeline = _load_diarize_pipeline()
+    pipeline.model.to(torch.device(DEVICE))
+    return pipeline
+
+
+def _park_diarize_models():
+    """Увозит закэшированные align и pyannote с карты в RAM."""
+    if DEVICE != "cuda":
+        return
+    cpu = torch.device("cpu")
+    for align_model, _ in _align_models.values():
+        align_model.to(cpu)
+    if _diarize_pipeline is not None:
+        _diarize_pipeline.model.to(cpu)
 
 
 @asynccontextmanager
@@ -123,7 +152,10 @@ async def lifespan(app: FastAPI):
             flush=True,
         )
     if PRELOAD_DIARIZE:
-        get_diarize_pipeline()
+        # Предзагрузка экономит чтение с диска, а не место на карте: до первого
+        # /diarize пайплайн лежит в RAM, как и между запросами.
+        _load_diarize_pipeline()
+        _park_diarize_models()
     yield
 
 
@@ -187,6 +219,72 @@ def _set_asr_hints(initial_prompt, hotwords):
     _model.options = dataclasses.replace(
         _model.options, initial_prompt=initial_prompt, hotwords=hotwords
     )
+
+
+def _asr_ct2_model():
+    """ctranslate2.models.Whisper внутри пайплайна whisperx, если он там есть.
+
+    Путь _model.model.model — это whisperx.asr.FasterWhisperPipeline →
+    faster_whisper.WhisperModel → CTranslate2. Достаём через getattr, а не
+    напрямую: смена версии whisperx не должна ронять /diarize, максимум —
+    возвращать выгрузку к прежнему поведению (веса лежат на карте всегда).
+    """
+    return getattr(getattr(_model, "model", None), "model", None)
+
+
+@contextmanager
+def _asr_weights_offloaded():
+    """Снимает веса ASR с карты на время align + диаризации.
+
+    Пик VRAM /diarize приходится не на ASR-фазу, а на align+pyannote, где веса
+    ASR только лежат резидентно (измерено на записи 46 минут: пик 5615 MiB из
+    5804 под float16, из них ~2250 MiB — сами веса; под int8_float16 пик 4655).
+    CTranslate2 держит их в своей памяти, torch.cuda.empty_cache их не трогает,
+    поэтому единственный способ освободить карту на тяжёлой фазе — unload_model.
+
+    to_cpu=False, а не True: to_cpu оставляет копию весов в RAM ради быстрого
+    возврата, а возврат здесь и так вне горячего пути — /diarize идёт минутами.
+
+    Возврат весов в finally: запрос, упавший на OOM, не имеет права оставить
+    сервер без модели — следующим придёт /transcribe от voice-input.
+    """
+    ct2 = _asr_ct2_model()
+    offloadable = DEVICE == "cuda" and hasattr(ct2, "unload_model")
+    if offloadable:
+        ct2.unload_model(to_cpu=False)
+    try:
+        yield
+    finally:
+        if offloadable and not ct2.model_is_loaded:
+            # Веса возвращаются ровно в ту память, где только что стояли арены
+            # align/pyannote, а CTranslate2 выделяет её мимо torch и его арен
+            # не видит. Без empty_cache load_model падает с CUDA out of memory
+            # (measured: torch держал 4478 MiB из 5804, весам нужно ~2250),
+            # и дошедший до конца пайплайна запрос всё равно отвечает 500.
+            if torch.cuda.is_initialized():
+                torch.cuda.empty_cache()
+            ct2.load_model()
+
+
+@contextmanager
+def _diarize_models_parked():
+    """Align + pyannote работают на GPU только внутри блока, после — в RAM.
+
+    Зеркало _asr_weights_offloaded. Оставшись на карте после первого /diarize,
+    wav2vec2 и pyannote (~1,2 ГБ живых тензоров, empty_cache их не трогает)
+    отнимали память у ASR-фазы следующего запроса, и под float16 он падал с
+    CUDA OOM на encode первого батча (measured: device_free 1988 MiB при
+    torch_allocated 1258). Считаются они по-прежнему на GPU: геттеры поднимают
+    их на карту перед фазой, цена — копирование весов туда-обратно на запрос.
+
+    Блок вложен внутрь _asr_weights_offloaded: модели съезжают с карты раньше,
+    чем туда возвращаются веса ASR. В finally — по той же причине, что и там:
+    упавший запрос не должен оставить их занимать карту.
+    """
+    try:
+        yield
+    finally:
+        _park_diarize_models()
 
 
 @app.post("/transcribe")
@@ -278,24 +376,28 @@ def diarize(
             result = _model.transcribe(audio, batch_size=BATCH_SIZE, language=lang)
             lang_code = result["language"]
 
-            align_model, metadata = get_align_model(lang_code)
-            result = whisperx.align(
-                result["segments"],
-                align_model,
-                metadata,
-                audio,
-                DEVICE,
-                return_char_alignments=False,
-            )
+            # Веса ASR на align+pyannote уже не нужны, а это самая тяжёлая по
+            # VRAM фаза — снимаем их с карты до конца пайплайна (см.
+            # _asr_weights_offloaded).
+            with _asr_weights_offloaded(), _diarize_models_parked():
+                align_model, metadata = get_align_model(lang_code)
+                result = whisperx.align(
+                    result["segments"],
+                    align_model,
+                    metadata,
+                    audio,
+                    DEVICE,
+                    return_char_alignments=False,
+                )
 
-            pipe = get_diarize_pipeline()
-            diarize_kwargs = {}
-            if min_speakers > 0:
-                diarize_kwargs["min_speakers"] = min_speakers
-            if max_speakers > 0:
-                diarize_kwargs["max_speakers"] = max_speakers
-            diarize_segments = pipe(audio, **diarize_kwargs)
-            result = whisperx.assign_word_speakers(diarize_segments, result)
+                pipe = get_diarize_pipeline()
+                diarize_kwargs = {}
+                if min_speakers > 0:
+                    diarize_kwargs["min_speakers"] = min_speakers
+                if max_speakers > 0:
+                    diarize_kwargs["max_speakers"] = max_speakers
+                diarize_segments = pipe(audio, **diarize_kwargs)
+                result = whisperx.assign_word_speakers(diarize_segments, result)
     finally:
         # После /diarize возвращаем драйверу арены, выросшие под align/pyannote.
         # Без этого caching allocator держит ~2,7 ГБ зарезервированными (арены
