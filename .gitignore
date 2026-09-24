@@ -5,3 +5,4 @@ __pycache__/
 .pytest_cache/
 .*.kate-swp
 formatting-transcript/tests/*.article.md
+extra/
