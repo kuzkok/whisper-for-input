@@ -1,89 +1,61 @@
 ---
 name: formatting-transcript
-description: Use when converting a raw transcript (YouTube auto-captions, Whisper output, lecture audio transcription, any source) into a readable article — only adds periods, commas, capitalization, and paragraph breaks while preserving every original word. Triggers on requests like "приведи транскрипт в вид статьи", "расставь знаки препинания", "разбей на абзацы", "format transcript". Works for Russian (incl. mixed-in English tech terms) and English.
+description: Use when converting a raw monologue transcript (lecture, talk, video — Whisper output, YouTube auto-captions, any source) into a readable article — full punctuation, paragraphs, fillers/false starts/repeats removed, obvious ASR errors fixed, while the speaker's wording is never paraphrased or distorted. Triggers on requests like «приведи транскрипт в вид статьи», «отформатируй транскрипт», «расставь знаки препинания», «разбей на абзацы», "format transcript". Works for Russian (incl. mixed-in English tech terms) and English. Not for diarized [HH:MM:SS] [Speaker] transcripts — that is transcript-cleanup.
 ---
 
 # Formatting Transcript
 
-Convert a raw transcript file (`.txt`, `.vtt`/`.srt` body, plain auto-captions, Whisper output, any audio-to-text source) into a clean Markdown article. **Iron Law: every word of the source must remain in the output, in the same order.** Only `.`, `,`, capitalization, and paragraph breaks are added. Nothing is paraphrased, summarized, reordered, translated, or omitted.
+Превращает сырой транскрипт монолога (`.txt`, тело `.vtt`/`.srt`, автосубтитры, выход Whisper) в Markdown-статью. Цель — читаемые предложения, в которых сказанное говорящим не пересказано и не искажено: уходит мусор устной речи и распознавания, мысли, формулировки и порядок остаются авторскими.
 
-## How it runs
+Скрипт режет текст на чанки по ~300 слов (граница — конец предложения в исходнике, если он рядом) и форматирует их параллельно через headless `claude -p --tools "" --json-schema` (haiku, JSON в / JSON out); соседний текст модель видит только как контекст, швы склеивает скрипт.
 
-This skill is implemented as a Python script — the chunk loop is fully deterministic in Python (no LLM in the orchestration), and Haiku is invoked headlessly per chunk via `claude -p --tools "" --json-schema ...` so the model can only return schema-validated JSON, no tool calls, no marker blocks.
+## How to run
 
-**To run it, resolve the script path by trying the two conventional skill install locations (project-local override → user-global), then invoke via Python:**
+Скрипт самодостаточен (stdlib), скилл — тонкая обёртка. Разрешить путь двумя literal-lookup'ами и запустить:
 
 ```bash
 SCRIPT="$(realpath .claude/skills/formatting-transcript/format_transcript.py 2>/dev/null \
   || realpath "$HOME/.claude/skills/formatting-transcript/format_transcript.py" 2>/dev/null)"
-python "$SCRIPT" "<source-path>" ["<output-path>"]
+python3 "$SCRIPT" "<source>" ["<output>"]
 ```
 
-No `find` and no glob — two literal `realpath` lookups so Claude Code's static permission analyzer does not prompt per run. If both fail, abort and tell the user the skill is not installed.
+Никаких `find` и глобов — два literal `realpath`, чтобы статический анализатор пермишенов не переспрашивал. Оба не нашлись — скилл не установлен, сообщить пользователю.
 
-Defaults:
-- Output path: `<source-stem>.article.md` next to the source if not provided.
-- The script refuses to overwrite an existing output file — pass an explicit second argument or delete the existing file first.
-- Progress and per-chunk word counts stream to stderr; the final ±2% verification is the success gate (exit code 0 = within tolerance, 1 = drift detected).
+- Выход по умолчанию — `<source-stem>.article.md` рядом с исходником; существующий файл не перезаписывается.
+- Необязательные флаги: `--model <слот>` (по умолчанию `haiku`), `--settings <файл>` — настройки, которые `claude` подмешивает поверх основных (например, роутер через `env`), `--workers <N>` — размер пула (по умолчанию 3), `--budget <USD>` — порог `--max-budget-usd` на вызов (по умолчанию 0.50; через роутер счётчик считает без кэша и по своему тарифу, порог приходится поднимать), `--timeout <с>` — таймаут вызова (по умолчанию 420; модели за роутером отвечают медленнее). Без просьбы пользователя не передавать.
+- stdout — только путь к выходу; stderr — журнал вызовов (токены, кэш, стоимость), отчёт потерь слов и итоговая строка «OK: чанков, время, слов».
+- Коды возврата: 0 — выход записан; 2 — ошибка аргументов или выход уже существует; 1 — чанк исчерпал ретраи или упёрлись в лимит подписки (429), выход не записан.
+- Прогон долгий: вызов на чанк идёт ~2 минуты (thinking), чанки — пулом по 3. Запускать с таймаутом Bash с запасом или в фоне.
 
-## What the script does
+После прогона показать пользователю путь к выходу и отчёт потерь, если он есть.
 
-1. **Normalize**: `fold -s -w 100 "<source>"` — soft-wraps long lines at column 100 at whitespace boundaries, so byte-exact word content is preserved while becoming sliceable. Output goes to memory, not a temp file.
-2. **Chunk**: 40 normalized lines per chunk → N chunks.
-3. **Per chunk**: call Haiku with the chunk text, the previous chunk's trailing buffer, and `is_final`. Haiku returns `{"write": "...", "buffer": "..."}` validated against a JSON schema. Append `write` to the output file; carry `buffer` into the next chunk.
-4. **Per-chunk integrity** (Python code, not prompt instruction):
-   - **Echo detector**: if `buffer == trailing_buffer` and `trailing_buffer` was non-empty → silent skip → retry (cap 2).
-   - **Empty write**: if the model returned no `write` content → retry (cap 2).
-   - On retry, an extra `retry_notice` field is added to the input.
-5. **Final verify**: `wc -w` source vs output. ≥ ±2% drift → exit 1, prints WARNING.
+## Policy: что можно править
 
-The subagent's full rules live in `chunk-prompt.md` alongside the script (used as `--system-prompt`).
+- Любая пунктуация и заглавные, разбивка на предложения и абзацы; пунктуацию исходника можно исправлять.
+- Заминки («э», «а-а», "um") — всегда; паразиты («ну», «вот», «значит», «как бы», "you know") — только там, где они ничего не значат.
+- Повторы подряд и брошенные на полуслове фальстарты («я я хотел», «оче очень»).
+- Оговорки в согласовании, когда без правки предложение не читается.
+- Очевидные ошибки распознавания без глоссария; английские термины кириллицей — латиницей в каноническом виде («реакт» → React).
 
-## When to use
+Чего нельзя: пересказ, сокращение смысла, синонимы и «улучшение» стиля, перестановка мыслей, перевод, заголовки и списки, добавление несказанного, удаление законченной фразы целиком. Полный текст политики с примерами — `chunk-prompt.md` рядом со скриптом.
 
-- User asks to "format a transcript", "make it readable", "add punctuation", "split into paragraphs", "превратить в статью", "отформатируй транскрипт", "расставь знаки препинания"
-- Source is monolithic text without punctuation, auto-captions stripped of timestamps, Whisper output, etc.
-- Goal: readable article that preserves the speaker's exact phrasing
+## Отчёт потерь
+
+Предупреждение, не гейт: по каждому чанку сравниваются мультимножества слов входа и выхода; замена слова на слово даёт баланс, заминки, паразиты и повторы вычитаются. Остаток печатается по чанкам. Пропавшая законченная фраза — пересказ, повод смотреть чанк; одиночные слова чаще паразиты со смыслом или ASR-мусор, который модель заменила.
 
 ## When NOT to use
 
-- User wants a summary, retelling, or shortening — different task
-- User wants translation — different task
-- User wants section headings, TOC, or structural rewriting — that is editing, not this skill
-- Source is already properly punctuated AND paragraphed — no work needed
+- Диаризованный транскрипт `[HH:MM:SS] [Speaker]` — это `transcript-cleanup` (каркас, имена, глоссарий из контекст-файла, паразитов не трогает).
+- Нужна суммаризация, пересказ или сокращение — другая задача.
+- Нужен перевод — другая задача.
+- Нужны заголовки, оглавление, структурная переработка — это редактура, не этот скилл.
 
-## What is preserved vs added
+## Failure modes
 
-| Added | Preserved verbatim |
-|-------|--------------------|
-| `.`, `,` | every source word in original order |
-| Capitalization at sentence starts and proper nouns | filler words («э», «ну», "um", "you know") |
-| Paragraph breaks (single `\n`) | existing source punctuation (`?`, `!`, quotes, dashes) |
-| | `[музыка]` / `[music]` markers |
-| | tech terms (`React`, `Docker`, `npm install`) verbatim |
-
-## What is forbidden
-
-- Adding any punctuation other than `.` and `,`: no `?`, `!`, `:`, `;`, `—`, `«»`, `""`, `''`, `()`, `[]`
-- Changing existing punctuation from the source
-- Removing or replacing filler words
-- Reordering words
-- Translating or transliterating tech terms
-- Inserting headings unless the user explicitly asks
-
-These are enforced by the system prompt in `chunk-prompt.md` and by the final ±2% word-count check.
-
-## Failure modes and what to do
-
-| Symptom | Meaning | Action |
-|---------|---------|--------|
-| Script exits with `WARNING source=X output=Y delta=N%` | Word count drifted by ≥2% | Inspect the output to find what was dropped or invented. Most likely a chunk where Haiku violated the Iron Law — re-run that chunk manually with `--debug api`. |
-| `exhausted N attempts; last error: ...` | A single chunk failed echo / empty-write detector or the API call N+1 times in a row | Re-run the whole script; if it repeats on the same chunk, that chunk's text may have unusual structure. Reduce CHUNK_LINES in the script as a workaround. |
-| `claude -p` permission prompts | `--tools ""` should prevent any tool call from being attempted, so this shouldn't happen. If it does, check that the `--tools ""` flag is being passed. |
-| Output file already exists | The script refuses to overwrite | Delete the existing file or pass an explicit output path argument. |
-
-## Cost guidance
-
-Per call: ~9k cache_creation + ~9k cache_read tokens (mostly Claude Code's harness scaffolding, not our system prompt) + ~1k chunk-specific = ~$0.015 first chunk, ~$0.004 subsequent (cache hit). For a 20-chunk transcript, expect ~$0.10–0.15 total. `--max-budget-usd 0.10` is set as a per-call safety cap.
-
-If you need to drive cost much lower, switch the script to `--bare` mode, which strips the Claude Code system prompt but requires `ANTHROPIC_API_KEY` instead of OAuth/keychain. Not enabled by default to keep the script working out of the box.
+| Симптом | Значение | Действие |
+|---|---|---|
+| rc 1, «api 429» | Лимит подписки | Повторить после сброса лимита, который назван в ошибке |
+| rc 1, «error_max_budget_usd» | Вызов превысил порог счётчика CLI (обычно через роутер: нет кэша префикса, чужой тариф) | Поднять `--budget` |
+| rc 1, «исчерпаны N попытки» | Чанк упал 3 раза подряд (ошибка вызова, пустой ответ, таймаут) | Если в попытках «таймаут» — поднять `--timeout`; иначе перезапустить; повторится на том же чанке — посмотреть его текст |
+| rc 2, «output already exists» | Выход не перезаписывается | Удалить файл или передать другой путь вторым аргументом |
+| В отчёте потерь законченная фраза | Модель пересказала или выбросила кусок | Сверить чанк с исходником; воспроизводится — повод править `chunk-prompt.md` |
