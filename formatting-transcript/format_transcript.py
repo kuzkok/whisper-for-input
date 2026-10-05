@@ -28,6 +28,11 @@ schema-валидный JSON на выходе. Разрез на чанки, с
 ровно свои слова, а соседний текст получает только как контекст. Поэтому чанки
 идут пулом: первый — отдельно (прогревает кэш префикса), остальные параллельно.
 
+Ответ каждого чанка сразу сохраняется в `<output>.parts/`; перезапуск с тем
+же выходом берёт оттуда готовые чанки и зовёт модель только для остальных
+(прогон, упавший на лимите подписки, продолжается после сброса). Статья
+пишется только целиком, после чего папка удаляется.
+
 Коды возврата: 0 — выход записан; 2 — ошибка аргументов или выход уже
 существует; 1 — чанк исчерпал ретраи, выход не записан. Дельта слов и отчёт
 потерь — предупреждения в stderr, rc не меняют. stdout — только путь к выходу.
@@ -35,9 +40,11 @@ schema-валидный JSON на выходе. Разрез на чанки, с
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -364,24 +371,71 @@ def split_chunks(words: list[str], size: int = CHUNK_WORDS) -> list[dict]:
     return chunks
 
 
-def format_all_chunks(system_prompt: str, chunks: list[dict], workers: int = WORKERS) -> list[dict]:
+def _part_key(system_prompt: str, chunk: dict) -> str:
+    """Отпечаток всего, от чего зависит ответ на чанк: сохранённый ответ
+    с другим промптом, моделью, настройками или разрезом не переиспользуется."""
+    h = hashlib.sha256()
+    for s in (MODEL, SETTINGS or "", system_prompt, chunk["before"], chunk["text"], chunk["after"]):
+        h.update(s.encode("utf-8") + b"\0")
+    return h.hexdigest()
+
+
+def _load_part(path: Path, key: str) -> dict | None:
+    try:
+        saved = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(saved, dict) or saved.get("key") != key:
+        return None
+    return {"text": saved["text"], "starts_paragraph": saved["starts_paragraph"]}
+
+
+def _save_part(path: Path, key: str, out: dict) -> None:
+    # через временный файл: прерванная запись не оставит битый JSON
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps({"key": key, **out}, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(path)
+
+
+def format_all_chunks(
+    system_prompt: str, chunks: list[dict], parts_dir: Path, workers: int = WORKERS,
+) -> list[dict]:
     """Выходы всех чанков в исходном порядке. Первый чанк идёт отдельно: он
     создаёт кэш общего префикса (обвязка CLI + system prompt), остальные его
     читают — холодный веер платил бы за запись кэша столько раз, сколько
     воркеров. Чанк, исчерпавший ретраи, валит прогон; ещё не начатые чанки
-    при этом отменяются, уже запущенные доживают до своего ответа."""
+    при этом отменяются, уже запущенные доживают до своего ответа.
+
+    Готовый ответ чанка сразу ложится в parts_dir, а сохранённый прошлым
+    запуском с тем же отпечатком берётся оттуда без вызова модели: полный
+    прогон длинного текста может не уместиться в одно окно лимита подписки."""
     total = len(chunks)
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    reused = 0
 
     def run(idx: int) -> dict:
-        return format_chunk(system_prompt, chunks[idx], f"чанк {idx + 1}/{total}")
+        nonlocal reused
+        path = parts_dir / f"{idx + 1:04d}.json"
+        key = _part_key(system_prompt, chunks[idx])
+        saved = _load_part(path, key)
+        if saved is not None:
+            reused += 1
+            return saved
+        out = format_chunk(system_prompt, chunks[idx], f"чанк {idx + 1}/{total}")
+        _save_part(path, key, out)
+        return out
 
-    results = [run(0)]
-    rest = list(range(1, total))
-    if workers > 1 and rest:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            results.extend(pool.map(run, rest))  # map отдаёт в порядке входа
-    else:
-        results.extend(run(i) for i in rest)
+    try:
+        results = [run(0)]
+        rest = list(range(1, total))
+        if workers > 1 and rest:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                results.extend(pool.map(run, rest))  # map отдаёт в порядке входа
+        else:
+            results.extend(run(i) for i in rest)
+    finally:
+        if reused:
+            print(f"из прошлых запусков взято чанков: {reused} из {total}", file=sys.stderr)
     return results
 
 
@@ -464,15 +518,20 @@ def main() -> int:
         print(f"source is empty: {src}", file=sys.stderr)
         return 2
     chunks = split_chunks(words)
+    parts_dir = out.with_name(out.name + ".parts")
     system_prompt = (Path(__file__).resolve().parent / "chunk-prompt.md").read_text()
 
     started = time.monotonic()
     try:
-        outs = format_all_chunks(system_prompt, chunks, args.workers)
+        outs = format_all_chunks(system_prompt, chunks, parts_dir, args.workers)
     except RuntimeError as e:
         print(str(e), file=sys.stderr)
         print_call_log()
-        print("выход не записан", file=sys.stderr)
+        print(
+            f"выход не записан; готовые чанки сохранены в {parts_dir} — "
+            "перезапуск той же командой продолжит с места остановки",
+            file=sys.stderr,
+        )
         return 1
 
     losses = []
@@ -485,6 +544,7 @@ def main() -> int:
     # прогон не оставляет полустатью, которую примут за готовую.
     text = join_chunks(chunks, outs) + "\n"
     out.write_text(text, encoding="utf-8")
+    shutil.rmtree(parts_dir, ignore_errors=True)
 
     print_call_log()
     print_word_losses(losses)
