@@ -65,10 +65,38 @@ class SkeletonTests(unittest.TestCase):
 
 
 class ChunkTests(unittest.TestCase):
+    @staticmethod
+    def _reps(lengths):
+        return [ct.Replica("00:00:01", "SPEAKER_00", "x" * n) for n in lengths]
+
     def test_replica_is_atom(self):
-        reps = [ct.Replica("00:00:01", "SPEAKER_00", "x") for _ in range(45)]
-        chunks = ct.chunk_replicas(reps)
-        self.assertEqual([len(c) for c in chunks], [40, 5])
+        reps = self._reps([10] * 45)
+        chunks = ct.chunk_replicas(reps, target=100)
+        self.assertEqual(sum(chunks, []), reps)
+        self.assertTrue(all(chunks))
+
+    def test_equal_chars_variable_replicas(self):
+        # один монолог против россыпи коротких: по символам поровну
+        reps = self._reps([1000] + [100] * 10)
+        chunks = ct.chunk_replicas(reps, target=1000)
+        self.assertEqual([len(c) for c in chunks], [1, 10])
+
+    def test_no_tiny_tail(self):
+        # жадный набор дал бы 1000+1000+100; тут три чанка ~700
+        reps = self._reps([100] * 21)
+        chunks = ct.chunk_replicas(reps, target=1000)
+        self.assertEqual([len(c) for c in chunks], [7, 7, 7])
+
+    def test_oversized_replica_alone(self):
+        reps = self._reps([100, 5000, 100])
+        chunks = ct.chunk_replicas(reps, target=1000)
+        self.assertEqual(sum(chunks, []), reps)
+        self.assertTrue(all(chunks))
+        self.assertIn([reps[1]], chunks)
+
+    def test_small_input_single_chunk(self):
+        reps = self._reps([10, 20, 30])
+        self.assertEqual(ct.chunk_replicas(reps, target=1000), [reps])
 
     def test_empty(self):
         self.assertEqual(ct.chunk_replicas([]), [])

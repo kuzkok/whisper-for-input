@@ -11,7 +11,8 @@ SPEAKER_XX (где спикер опознан по содержанию) и в�
   1. sonnet строит карту «SPEAKER_XX → имя» по скелету встречи (первые ~30
      слов каждой реплики); карта показывается, подтверждается по stdin
      (или --yes); подстановка имён — детерминированная замена строк здесь.
-  2. haiku чистит текст чанками по ~40 реплик; чанки независимы и идут
+  2. haiku чистит текст чанками по ~CHUNK_CHARS символов (число реплик в
+     чанке плавает, реплика — атом); чанки независимы и идут
      пулом потоков (--workers, по умолчанию 3); каркас (таймкоды, метки)
      через модель не проходит — скрипт сшивает выход сам.
 
@@ -31,7 +32,13 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 
-CHUNK_REPLICAS = 40
+# Чанк фазы 2 меряется символами текста, а не репликами: время ответа haiku
+# растёт с объёмом текста, а длина реплики гуляет на порядки — на встрече
+# реплика в среднем короткая, в подкасте монолог гостя доходит до 6 тыс.
+# символов. Чанк по 15 реплик на подкасте выходил от 1 до 20 тыс. символов, и
+# самый толстый определял время всей фазы. 5000 — примерно 15 реплик подкаста
+# или 40+ реплик встречи; такие чанки haiku стабильно отдаёт в пределах таймаута.
+CHUNK_CHARS = 5000
 CONTEXT_REPLICAS = 3
 SKELETON_WORDS = 30
 SIGNAL_HEAD_REPLICAS = 2  # первые реплики каждого спикера в сокращённом скелете
@@ -43,7 +50,10 @@ PHASE1_TIMEOUT_S = 300
 # Фаза 2: 420 с — под слотом haiku может оказаться медленная модель (на
 # корпоративном роутере чанк таймаутил на 180 с и уходил в ретрай); нативный
 # claude-haiku-4-5 укладывается примерно в 4 минуты на чанк из 40 реплик.
-PHASE2_TIMEOUT_S = 420
+# На подкасте с длинными монологами чанк из 40 реплик (~24 тыс. символов) не
+# уложился и в 420 с. Чанки теперь меряются символами (CHUNK_CHARS), но одна
+# реплика длиннее CHUNK_CHARS всё равно идёт целиком, поэтому таймаут с запасом.
+PHASE2_TIMEOUT_S = 1200
 # Пороги --max-budget-usd. На подписке счётчик считает list price (costBasis
 # list, кэш общего префикса работает — system prompt и контекст-файл чанки
 # читают из кэша), реальных списаний нет: пороги остаются страховкой от
@@ -369,9 +379,33 @@ def skeletonize(replicas: list[Replica], nums: list[int] | None = None) -> list[
     return out
 
 
-def chunk_replicas(replicas: list[Replica], size: int = CHUNK_REPLICAS) -> list[list[Replica]]:
-    """Реплика — атом: между репликами не режем."""
-    return [replicas[i : i + size] for i in range(0, len(replicas), size)]
+def chunk_replicas(replicas: list[Replica], target: int = CHUNK_CHARS) -> list[list[Replica]]:
+    """Чанки примерно поровну по символам текста, реплика — атом.
+
+    Число чанков — ceil(всего / target), затем граница k-го чанка ставится на
+    стык реплик, ближайший к k/n от общего объёма. Жадное «набивать до порога»
+    оставляло бы в конце огрызок и не выравнивало чанки между собой. Реплика
+    длиннее target уходит отдельным чанком целиком; пустых чанков не бывает.
+    """
+    if not replicas:
+        return []
+    sizes = [max(len(r.text), 1) for r in replicas]
+    total = sum(sizes)
+    n = min(len(replicas), -(-total // target))
+    cum: list[int] = []  # cum[i] — символов в replicas[:i+1]
+    acc = 0
+    for size in sizes:
+        acc += size
+        cum.append(acc)
+    cuts = [0]
+    for k in range(1, n):
+        goal = total * k / n
+        lo = cuts[-1] + 1  # хотя бы одна реплика в текущем чанке
+        hi = len(replicas) - (n - k)  # хотя бы по одной на оставшиеся
+        best = min(range(lo, hi + 1), key=lambda i: abs(cum[i - 1] - goal))
+        cuts.append(best)
+    cuts.append(len(replicas))
+    return [replicas[a:b] for a, b in zip(cuts, cuts[1:])]
 
 
 def context_lines(replicas: list[Replica], upto: int, k: int = CONTEXT_REPLICAS) -> str:
@@ -859,7 +893,7 @@ def main() -> int:
     # Фаза 2 — чанковая чистка
     chunks = chunk_replicas(named)
     print(
-        f"{len(chunks)} чанков по <= {CHUNK_REPLICAS} реплик, воркеров: {workers}",
+        f"{len(chunks)} чанков по ~{CHUNK_CHARS} симв, воркеров: {workers}",
         file=sys.stderr,
     )
     cleaned_by_chunk = clean_all_chunks(
