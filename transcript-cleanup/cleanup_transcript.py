@@ -7,7 +7,7 @@ Usage: cleanup_transcript.py <source> <context-file> [-o out] [--yes] [--workers
 плюс проектный контекст-файл. Выход — тот же каркас с именами вместо
 SPEAKER_XX (где спикер опознан по содержанию) и вычищенным текстом реплик.
 
-Две фазы, обе через headless `claude -p --tools "" --json-schema`:
+Три фазы, все через headless `claude -p --tools "" --json-schema`:
   1. sonnet строит карту «SPEAKER_XX → имя» по скелету встречи (первые ~30
      слов каждой реплики); карта показывается, подтверждается по stdin
      (или --yes); подстановка имён — детерминированная замена строк здесь.
@@ -15,15 +15,27 @@ SPEAKER_XX (где спикер опознан по содержанию) и в�
      чанке плавает, реплика — атом); чанки независимы и идут
      пулом потоков (--workers, по умолчанию 3); каркас (таймкоды, метки)
      через модель не проходит — скрипт сшивает выход сам.
+  3. haiku разбивает на абзацы длинные реплики (от PARAGRAPH_MIN_CHARS
+     символов): скрипт режет вычищенный текст на пронумерованные
+     предложения, модель возвращает только номера предложений, с которых
+     начинается абзац. Текст через модель не проходит и не меняется.
+
+Результат каждой фазы сохраняется в `<output>.parts/` сразу, как готов:
+принятая карта спикеров, ответ каждого чанка фаз 2 и 3. Перезапуск той же
+командой берёт оттуда всё, что совпало по отпечатку (модель, промпт, вход
+вызова, контекст-файл), и зовёт модель только для остального — упавший на
+фазе 2 прогон не платит заново за фазу 1. Папка удаляется после записи выхода.
 
 LLM вызывается только в inference-режиме: JSON на входе, schema-валидный
 JSON на выходе, без инструментов. Скелетизация, чанкование, подстановка,
-ретраи и обе верификации — детерминированный код.
+разрез на предложения, ретраи и обе верификации — детерминированный код.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+import shutil
 import subprocess
 import sys
 import threading
@@ -66,6 +78,14 @@ PHASE2_BUDGET_USD = "1.50"
 # исходника, а не из выхода предыдущего чанка). 3 — компромисс между временем
 # прогона и расходом usage-окна подписки; 1 возвращает последовательный прогон.
 PHASE2_WORKERS = 3
+# Фаза 3: реплика от 1000 символов — уже стена текста в несколько десятков
+# строк; короче абзацы не нужны. Выход модели — несколько чисел на реплику,
+# поэтому вызов короткий, а бюджет и таймаут скромнее фазы 2. Пул тот же,
+# --workers, чанки — те же CHUNK_CHARS, но из одних длинных реплик.
+PARAGRAPH_MIN_CHARS = 1000
+PHASE3_MODEL = "haiku"
+PHASE3_TIMEOUT_S = 420
+PHASE3_BUDGET_USD = "0.50"
 
 # Каркас: [HH:MM:SS] [метка] текст. Метка — SPEAKER_XX или UNKNOWN.
 LINE_RE = re.compile(r"^\[(\d{2}:\d{2}:\d{2})\] \[([^\]]+)\] (.*)$")
@@ -126,6 +146,26 @@ SCHEMA_CLEAN = {
         },
     },
     "required": ["cleaned", "guesses"],
+    "additionalProperties": False,
+}
+
+SCHEMA_PARAGRAPHS = {
+    "type": "object",
+    "properties": {
+        "paragraphs": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "n": {"type": "integer"},
+                    "starts": {"type": "array", "items": {"type": "integer"}},
+                },
+                "required": ["n", "starts"],
+                "additionalProperties": False,
+            },
+        }
+    },
+    "required": ["paragraphs"],
     "additionalProperties": False,
 }
 
@@ -268,6 +308,40 @@ class Replica:
 
     def line(self) -> str:
         return f"[{self.time}] [{self.label}] {self.text}"
+
+
+# ── сохранённые результаты для дозапуска ─────────────────────────────────────
+
+
+def part_key(*fields: object) -> str:
+    """Отпечаток всего, от чего зависит ответ вызова: сохранённое с другим
+    промптом, моделью, входом или контекст-файлом не переиспользуется."""
+    h = hashlib.sha256()
+    for f in fields:
+        h.update(json.dumps(f, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\0")
+    return h.hexdigest()
+
+
+def load_part(parts_dir: Path | None, name: str, key: str) -> dict | None:
+    if parts_dir is None:
+        return None
+    try:
+        saved = json.loads((parts_dir / name).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(saved, dict) or saved.get("key") != key:
+        return None
+    return saved.get("data")
+
+
+def save_part(parts_dir: Path | None, name: str, key: str, data: object) -> None:
+    if parts_dir is None:
+        return
+    parts_dir.mkdir(parents=True, exist_ok=True)
+    # через временный файл: прерванная запись не оставит битый JSON
+    tmp = parts_dir / (name + ".tmp")
+    tmp.write_text(json.dumps({"key": key, "data": data}, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(parts_dir / name)
 
 
 # ── парсинг / скелет / чанки ─────────────────────────────────────────────────
@@ -594,9 +668,11 @@ def clean_chunk(
     context: str,
     context_file: str,
     label: str,
-) -> list[str]:
-    """Очищенные тексты реплик чанка. Каркас не проходит через модель:
-    на входе только n + text, метку невозможно испортить."""
+) -> tuple[list[str], list]:
+    """Очищенные тексты реплик чанка и сырые догадки модели. Каркас не
+    проходит через модель: на входе только n + text, метку невозможно
+    испортить. Догадки в журнал пишет вызывающий — вместе с сохранением
+    чанка, чтобы дозапуск восстановил их из сохранённого."""
     payload = {
         "replicas": [{"n": i, "text": r.text} for i, r in enumerate(chunk, start=1)],
         "context_lines": context,
@@ -623,9 +699,9 @@ def clean_chunk(
                 raise RuntimeError(f"длина массива {len(cleaned)} != {len(chunk)} реплик")
             if any(not s.strip() for s in cleaned):
                 raise RuntimeError("пустые строки в cleaned")
-            # После проверок: догадки неудачной попытки в журнал не попадают.
-            record_guesses(out.get("guesses"), chunk, label)
-            return cleaned
+            # После проверок: догадки неудачной попытки наружу не уходят.
+            guesses = out.get("guesses")
+            return cleaned, guesses if isinstance(guesses, list) else []
         except (
             subprocess.CalledProcessError,
             subprocess.TimeoutExpired,
@@ -644,6 +720,7 @@ def clean_all_chunks(
     chunks: list[list[Replica]],
     context_file: str,
     workers: int = PHASE2_WORKERS,
+    parts_dir: Path | None = None,
 ) -> list[list[str]]:
     """Очищенные тексты всех чанков — список по чанку, в исходном порядке.
 
@@ -656,6 +733,9 @@ def clean_all_chunks(
     восстанавливается по входу, а не по времени завершения. Чанк, исчерпавший
     ретраи, валит всю фазу (выход всё-или-ничего); ещё не начатые чанки при
     этом отменяются, уже запущенные доживают до своего ответа.
+
+    С parts_dir готовый чанк сразу сохраняется, а совпавший по отпечатку
+    из прошлого запуска берётся без вызова модели — вместе с догадками.
     """
     total = len(chunks)
     if not total:
@@ -666,13 +746,25 @@ def clean_all_chunks(
         offsets.append(consumed)
         consumed += len(chunk)
 
+    reused = 0
+
     def run(idx: int) -> list[str]:
+        nonlocal reused
         chunk = chunks[idx]
         label = f"чанк {idx + 1}/{total}"
+        context = context_lines(named, offsets[idx])
+        name = f"clean-{idx + 1:04d}.json"
+        key = part_key(PHASE2_MODEL, chunk_prompt, context_file, context,
+                       [r.text for r in chunk])
+        saved = load_part(parts_dir, name, key)
+        if saved is not None:
+            reused += 1
+            record_guesses(saved["guesses"], chunk, label)
+            return saved["cleaned"]
         before = sum(len(r.text) for r in chunk)
-        cleaned = clean_chunk(
-            chunk_prompt, chunk, context_lines(named, offsets[idx]), context_file, label
-        )
+        cleaned, guesses = clean_chunk(chunk_prompt, chunk, context, context_file, label)
+        save_part(parts_dir, name, key, {"cleaned": cleaned, "guesses": guesses})
+        record_guesses(guesses, chunk, label)
         after = sum(len(s) for s in cleaned)
         print(
             f"{label}: {len(chunk)} реплик, {before}→{after} симв "
@@ -681,16 +773,169 @@ def clean_all_chunks(
         )
         return cleaned
 
+    try:
+        results = [run(0)]
+        rest = list(range(1, total))
+        if rest and workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                results.extend(pool.map(run, rest))  # map отдаёт в порядке входа
+        else:
+            results.extend(run(i) for i in rest)
+    finally:
+        if reused:
+            print(f"фаза 2: из прошлых запусков взято чанков: {reused} из {total}",
+                  file=sys.stderr)
+    return results
+
+
+# ── фаза 3: абзацы в длинных репликах ────────────────────────────────────────
+
+# Граница предложения: знак конца, необязательная закрывающая кавычка или
+# скобка, пробел, затем заглавная буква или цифра (возможно, за открывающей
+# кавычкой). Строчная после точки — не граница: так «т. е. мы» и «и т. д.,
+# а потом» не режутся. Лишняя граница не страшна — она лишь даёт модели ещё
+# одно место, где абзац мог бы начаться.
+SENTENCE_END_RE = re.compile(r'[.!?…]+[»")\]]*\s+(?=[«"(\[]?[0-9A-ZА-ЯЁ])')
+
+
+def sentence_starts(text: str) -> list[int]:
+    """Смещения начала каждого предложения в text; первое — 0."""
+    return [0] + [m.end() for m in SENTENCE_END_RE.finditer(text)]
+
+
+def split_sentences(text: str) -> list[str]:
+    starts = sentence_starts(text) + [len(text)]
+    return [text[a:b].strip() for a, b in zip(starts, starts[1:])]
+
+
+def apply_paragraphs(text: str, starts: list[int]) -> str:
+    """Текст с абзацами: перед предложениями с номерами из starts (1-based)
+    пробелы заменяются одним \n. Больше в тексте не меняется ничего."""
+    offs = sentence_starts(text)
+    picked = sorted({i for i in starts if 1 < i <= len(offs)})  # 1 — начало реплики
+    cuts = [0] + [offs[i - 1] for i in picked] + [len(text)]
+    return "\n".join(text[a:b].strip() for a, b in zip(cuts, cuts[1:]))
+
+
+def paragraph_chunk(
+    prompt: str, chunk: list[Replica], label: str
+) -> list[list[int]]:
+    """Номера предложений, с которых начинаются абзацы, — по списку на
+    реплику чанка. Номер 1 не нужен (первое предложение и так начинает
+    реплику) и отбрасывается; номер вне реплики — ошибка вызова и ретрай."""
+    sentences = [split_sentences(r.text) for r in chunk]
+    payload = {
+        "replicas": [
+            {"n": i, "sentences": [{"i": j, "text": t} for j, t in enumerate(ss, start=1)]}
+            for i, ss in enumerate(sentences, start=1)
+        ]
+    }
+    last_err: Exception | None = None
+    for attempt in range(MAX_RETRIES + 1):
+        if attempt:
+            payload["retry_notice"] = (
+                f"Предыдущая попытка не прошла проверку: {last_err}. Верни по записи "
+                "на каждую реплику, номера предложений — только из этой реплики."
+            )
+        try:
+            out = call_claude(
+                prompt,
+                json.dumps(payload, ensure_ascii=False),
+                PHASE3_MODEL,
+                SCHEMA_PARAGRAPHS,
+                PHASE3_TIMEOUT_S,
+                PHASE3_BUDGET_USD,
+            )
+            by_n = {row["n"]: row["starts"] for row in out["paragraphs"]}
+            if sorted(by_n) != list(range(1, len(chunk) + 1)):
+                raise RuntimeError(
+                    f"номера реплик {sorted(by_n)} != 1..{len(chunk)}"
+                )
+            result = []
+            for n, ss in enumerate(sentences, start=1):
+                starts = sorted(set(by_n[n]) - {1})
+                bad = [i for i in starts if not 1 < i <= len(ss)]
+                if bad:
+                    raise RuntimeError(f"реплика {n}: номера {bad} вне 2..{len(ss)}")
+                result.append(starts)
+            return result
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            json.JSONDecodeError,
+            RuntimeError,
+            KeyError,
+            TypeError,
+        ) as e:
+            last_err = e
+            print(f"  {label}: попытка {attempt + 1} — ошибка: {e}", file=sys.stderr)
+    raise RuntimeError(f"{label}: исчерпаны {MAX_RETRIES + 1} попыток; последняя: {last_err}")
+
+
+def paragraph_long_replicas(
+    prompt: str,
+    replicas: list[Replica],
+    workers: int = PHASE2_WORKERS,
+    parts_dir: Path | None = None,
+) -> list[Replica]:
+    """Реплики с абзацами в длинных. Фаза косметическая: чанк, исчерпавший
+    ретраи, не валит прогон — его реплики остаются одним абзацем, а в stderr
+    идёт предупреждение. Иначе сбой на абзацах выбросил бы уже оплаченные
+    фазы 1 и 2. Первый чанк идёт отдельно — прогревает кэш префикса."""
+    long_idx = [
+        i for i, r in enumerate(replicas)
+        if len(r.text) >= PARAGRAPH_MIN_CHARS and len(sentence_starts(r.text)) > 1
+    ]
+    out = list(replicas)
+    if not long_idx:
+        print("фаза 3: длинных реплик нет", file=sys.stderr)
+        return out
+    groups = chunk_replicas([replicas[i] for i in long_idx])
+    print(
+        f"фаза 3: {len(long_idx)} реплик от {PARAGRAPH_MIN_CHARS} симв, "
+        f"{len(groups)} чанков",
+        file=sys.stderr,
+    )
+    total = len(groups)
+    reused = 0
+
+    def run(g: int) -> list[list[int]] | None:
+        nonlocal reused
+        label = f"абзацы {g + 1}/{total}"
+        name = f"para-{g + 1:04d}.json"
+        key = part_key(PHASE3_MODEL, prompt, [r.text for r in groups[g]])
+        saved = load_part(parts_dir, name, key)
+        if saved is not None:
+            reused += 1
+            return saved
+        try:
+            starts = paragraph_chunk(prompt, groups[g], label)
+        except RuntimeError as e:
+            print(f"  {e}; реплики чанка остаются без абзацев", file=sys.stderr)
+            return None
+        save_part(parts_dir, name, key, starts)
+        return starts
+
     results = [run(0)]
     rest = list(range(1, total))
-    if not rest:
-        return results
-    if workers > 1:
+    if workers > 1 and rest:
         with ThreadPoolExecutor(max_workers=workers) as pool:
-            results.extend(pool.map(run, rest))  # map отдаёт в порядке входа
+            results.extend(pool.map(run, rest))
     else:
-        results.extend(run(i) for i in rest)
-    return results
+        results.extend(run(g) for g in rest)
+
+    if reused:
+        print(f"фаза 3: из прошлых запусков взято чанков: {reused} из {total}",
+              file=sys.stderr)
+    pos = iter(long_idx)
+    paragraphs = 0
+    for group, starts in zip(groups, results):
+        for r, st in zip(group, starts or [[] for _ in group]):
+            i = next(pos)
+            out[i] = Replica(r.time, r.label, apply_paragraphs(r.text, st))
+            paragraphs += len(st) + 1
+    print(f"фаза 3: абзацев в длинных репликах: {paragraphs}", file=sys.stderr)
+    return out
 
 
 # ── верификации ──────────────────────────────────────────────────────────────
@@ -863,6 +1108,7 @@ def main() -> int:
     here = Path(__file__).resolve().parent
     map_prompt = (here / "map-prompt.md").read_text(encoding="utf-8")
     chunk_prompt = (here / "chunk-prompt.md").read_text(encoding="utf-8")
+    paragraph_prompt = (here / "paragraph-prompt.md").read_text(encoding="utf-8")
     context_file = ctx_path.read_text(encoding="utf-8")
 
     src = parse_transcript(src_path.read_text(encoding="utf-8"))
@@ -880,13 +1126,24 @@ def main() -> int:
         f"{SIGNAL_HEAD_REPLICAS} каждого спикера)",
         file=sys.stderr,
     )
-    mapping, evidence = map_speakers(map_prompt, skeleton, context_file)
-    phase1_cost = spent_usd()
-    if yes:
+    parts_dir = out_path.with_name(out_path.name + ".parts")
+    map_key = part_key(PHASE1_MODEL, map_prompt, context_file, skeleton)
+    saved_map = load_part(parts_dir, "map.json", map_key)
+    if saved_map is not None:
+        # Сохраняется уже принятая карта (с ручными правками, если были) —
+        # подтверждать её второй раз незачем.
+        mapping, evidence = saved_map["mapping"], saved_map["evidence"]
         print_map(mapping, evidence)
-        print("--yes: карта принята без подтверждения", file=sys.stderr)
+        print("карта взята из прошлого запуска (принята тогда)", file=sys.stderr)
     else:
-        mapping = confirm_map(mapping, evidence)
+        mapping, evidence = map_speakers(map_prompt, skeleton, context_file)
+        if yes:
+            print_map(mapping, evidence)
+            print("--yes: карта принята без подтверждения", file=sys.stderr)
+        else:
+            mapping = confirm_map(mapping, evidence)
+        save_part(parts_dir, "map.json", map_key, {"mapping": mapping, "evidence": evidence})
+    phase1_cost = spent_usd()
 
     named = substitute_names(src, mapping)
 
@@ -896,18 +1153,37 @@ def main() -> int:
         f"{len(chunks)} чанков по ~{CHUNK_CHARS} симв, воркеров: {workers}",
         file=sys.stderr,
     )
-    cleaned_by_chunk = clean_all_chunks(
-        chunk_prompt, named, chunks, context_file, workers
-    )
+    try:
+        cleaned_by_chunk = clean_all_chunks(
+            chunk_prompt, named, chunks, context_file, workers, parts_dir
+        )
+    except RuntimeError as e:
+        print(str(e), file=sys.stderr)
+        print_call_log()
+        print(
+            f"выход не записан; карта и готовые чанки сохранены в {parts_dir} — "
+            "перезапуск той же командой продолжит с места остановки",
+            file=sys.stderr,
+        )
+        return 1
     cleaned_replicas: list[Replica] = []
     for chunk, cleaned in zip(chunks, cleaned_by_chunk):
         for r, text in zip(chunk, cleaned):
             cleaned_replicas.append(Replica(r.time, r.label, text.strip()))
+    phase2_cost = spent_usd() - phase1_cost
+
+    # Фаза 3 — абзацы в длинных репликах
+    cleaned_replicas = paragraph_long_replicas(
+        paragraph_prompt, cleaned_replicas, workers, parts_dir
+    )
+    phase3_cost = spent_usd() - phase1_cost - phase2_cost
+
     print_call_log()
     print_guess_log()
     print(
-        f"счётчик CLI: фаза 1 ${phase1_cost:.2f}, фаза 2 ${spent_usd() - phase1_cost:.2f}, "
-        f"итого ${spent_usd():.2f} (list price; на подписке не списывается)",
+        f"счётчик CLI: фаза 1 ${phase1_cost:.2f}, фаза 2 ${phase2_cost:.2f}, "
+        f"фаза 3 ${phase3_cost:.2f}, итого ${spent_usd():.2f} "
+        "(list price; на подписке не списывается)",
         file=sys.stderr,
     )
 
@@ -920,6 +1196,7 @@ def main() -> int:
         return 1
 
     out_path.write_text("\n\n".join(r.line() for r in cleaned_replicas) + "\n", encoding="utf-8")
+    shutil.rmtree(parts_dir, ignore_errors=True)
     print_word_losses(word_losses(src, cleaned_replicas, guess_log()))
     total_before = sum(len(r.text) for r in src)
     total_after = sum(len(r.text) for r in cleaned_replicas)

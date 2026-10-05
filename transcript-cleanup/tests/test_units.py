@@ -111,6 +111,82 @@ class ChunkTests(unittest.TestCase):
         self.assertEqual(ct.context_lines(reps, upto=0), "")
 
 
+class ParagraphTests(unittest.TestCase):
+    TEXT = "Привет. Это т. е. тест! «Цитата». 5 штук. и строчная. Конец?"
+
+    def test_split_sentences(self):
+        self.assertEqual(
+            ct.split_sentences(self.TEXT),
+            ["Привет.", "Это т. е. тест!", "«Цитата».", "5 штук. и строчная.", "Конец?"],
+        )
+
+    def test_apply_paragraphs_only_inserts_newlines(self):
+        out = ct.apply_paragraphs(self.TEXT, [3, 5])
+        self.assertEqual(out, "Привет. Это т. е. тест!\n«Цитата». 5 штук. и строчная.\nКонец?")
+        self.assertEqual(out.replace("\n", " "), self.TEXT)
+
+    def test_apply_paragraphs_ignores_first_and_out_of_range(self):
+        self.assertEqual(ct.apply_paragraphs(self.TEXT, [1, 99]), self.TEXT)
+        self.assertEqual(ct.apply_paragraphs(self.TEXT, []), self.TEXT)
+
+    def _chunk(self):
+        return [ct.Replica("00:00:01", "A", self.TEXT), ct.Replica("00:00:02", "B", "Раз. Два.")]
+
+    def test_paragraph_chunk_retries_on_bad_index(self):
+        answers = [
+            {"paragraphs": [{"n": 1, "starts": [9]}, {"n": 2, "starts": []}]},
+            {"paragraphs": [{"n": 2, "starts": [2]}, {"n": 1, "starts": [5, 3, 1]}]},
+        ]
+        payloads = []
+
+        def fake(system_prompt, user_msg, model, schema, timeout_s, budget_usd):
+            payloads.append(json.loads(user_msg))
+            return answers.pop(0)
+
+        with mock.patch.object(ct, "call_claude", fake), \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            starts = ct.paragraph_chunk("p", self._chunk(), "абзацы 1/1")
+        self.assertEqual(starts, [[3, 5], [2]])
+        self.assertEqual(len(payloads), 2)
+        self.assertIn("retry_notice", payloads[1])
+        self.assertEqual(payloads[0]["replicas"][1]["sentences"],
+                         [{"i": 1, "text": "Раз."}, {"i": 2, "text": "Два."}])
+
+    def test_paragraph_chunk_missing_replica_is_error(self):
+        def fake(system_prompt, user_msg, model, schema, timeout_s, budget_usd):
+            return {"paragraphs": [{"n": 1, "starts": []}]}
+
+        with mock.patch.object(ct, "call_claude", fake), \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(RuntimeError):
+                ct.paragraph_chunk("p", self._chunk(), "абзацы 1/1")
+
+    def test_failed_chunk_leaves_replicas_intact(self):
+        """Фаза косметическая: исчерпанные ретраи не валят прогон."""
+        long_text = "Длинное предложение для проверки абзацев. " * 30
+        reps = [ct.Replica("00:00:01", "A", long_text.strip()),
+                ct.Replica("00:00:02", "B", "Коротко.")]
+
+        def fake(system_prompt, user_msg, model, schema, timeout_s, budget_usd):
+            raise RuntimeError("сбой вызова")
+
+        with mock.patch.object(ct, "call_claude", fake), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            out = ct.paragraph_long_replicas("p", reps, workers=1)
+        self.assertEqual(out, reps)
+        self.assertIn("остаются без абзацев", err.getvalue())
+
+    def test_short_replicas_skip_model(self):
+        reps = [ct.Replica("00:00:01", "A", "Коротко. Совсем.")]
+
+        def fake(*a):
+            raise AssertionError("модель не должна вызываться")
+
+        with mock.patch.object(ct, "call_claude", fake), \
+                mock.patch("sys.stderr", new_callable=io.StringIO):
+            self.assertEqual(ct.paragraph_long_replicas("p", reps), reps)
+
+
 class AddressFormsTests(unittest.TestCase):
     CTX = """
 ## Спикеры
@@ -257,10 +333,11 @@ class RetryTests(unittest.TestCase):
         try:
             chunk = [ct.Replica("00:00:01", "SPEAKER_00", "один"),
                      ct.Replica("00:00:02", "SPEAKER_00", "два")]
-            out = ct.clean_chunk("prompt", chunk, "", "ctx", "label")
+            out, guesses = ct.clean_chunk("prompt", chunk, "", "ctx", "label")
         finally:
             ct.call_claude = orig
         self.assertEqual(out, ["один.", "два."])
+        self.assertEqual(guesses, [])
         self.assertEqual(len(calls), 2)
 
     def test_clean_chunk_exhausts_retries(self):
@@ -340,7 +417,7 @@ class Phase2PoolTests(unittest.TestCase):
             # поздние чанки отвечают быстрее — порядок завершения обратный
             idx = int(chunk[0].text[1])
             time.sleep(0.05 * (len(chunks) - idx))
-            return [f"{r.text}!" for r in chunk]
+            return [f"{r.text}!" for r in chunk], []
 
         orig = ct.clean_chunk
         ct.clean_chunk = fake
@@ -364,7 +441,7 @@ class Phase2PoolTests(unittest.TestCase):
             time.sleep(0.1)
             with lock:
                 live["n"] -= 1
-            return [r.text for r in chunk]
+            return [r.text for r in chunk], []
 
         orig = ct.clean_chunk
         ct.clean_chunk = fake
@@ -386,7 +463,7 @@ class Phase2PoolTests(unittest.TestCase):
             live["n"] += 1
             peak["n"] = max(peak["n"], live["n"])
             live["n"] -= 1
-            return [r.text for r in chunk]
+            return [r.text for r in chunk], []
 
         orig = ct.clean_chunk
         ct.clean_chunk = fake
@@ -404,7 +481,7 @@ class Phase2PoolTests(unittest.TestCase):
         def fake(chunk_prompt, chunk, context, context_file, label):
             if chunk[0].text.startswith("ч2"):
                 raise RuntimeError("исчерпаны попытки")
-            return [r.text for r in chunk]
+            return [r.text for r in chunk], []
 
         orig = ct.clean_chunk
         ct.clean_chunk = fake
@@ -423,7 +500,7 @@ class Phase2PoolTests(unittest.TestCase):
 
         def fake(chunk_prompt, chunk, context, context_file, label):
             seen[chunk[0].text] = context
-            return [f"ПЕРЕПИСАНО-{r.text}" for r in chunk]
+            return [f"ПЕРЕПИСАНО-{r.text}" for r in chunk], []
 
         orig = ct.clean_chunk
         ct.clean_chunk = fake
@@ -555,7 +632,7 @@ class GuessLogTests(unittest.TestCase):
         self.assertIn("аббревиатура со слуха", out)
 
     def test_retry_does_not_duplicate_guesses(self):
-        """Догадки пишутся после проверок: запись неудачной попытки в журнал не попадает."""
+        """Догадки отдаются после проверок: догадки неудачной попытки наружу не уходят."""
         chunk = self.chunk()
         guess = [{"n": 1, "from": "a", "to": "b", "basis": "c"}]
         answers = [
@@ -564,9 +641,10 @@ class GuessLogTests(unittest.TestCase):
         ]
         before = len(ct.guess_log())
         with mock.patch.object(ct, "call_claude", side_effect=answers):
-            out = ct.clean_chunk("prompt", chunk, "", "ctx", "label")
+            out, guesses = ct.clean_chunk("prompt", chunk, "", "ctx", "label")
         self.assertEqual(out, ["первая", "вторая"])
-        self.assertEqual(len(ct.guess_log()), before + 1)
+        self.assertEqual(guesses, guess)
+        self.assertEqual(len(ct.guess_log()), before)  # журнал пишет вызывающий
 
 
 class WordLossTests(unittest.TestCase):

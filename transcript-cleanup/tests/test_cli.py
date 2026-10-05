@@ -40,10 +40,10 @@ class CliTests(unittest.TestCase):
         shutil.copy2(FIXTURE_CONTEXT, self.ctx)
         self.out = tmp / "meeting.clean.txt"
 
-    def run_script(self, *args: str) -> subprocess.CompletedProcess:
+    def run_script(self, *args: str, env_extra: dict | None = None) -> subprocess.CompletedProcess:
         return subprocess.run(
             ["python3", str(SCRIPT), *args],
-            capture_output=True, text=True, env=self.env,
+            capture_output=True, text=True, env={**self.env, **(env_extra or {})},
             stdin=subprocess.DEVNULL, timeout=60,
         )
 
@@ -108,6 +108,95 @@ class CliTests(unittest.TestCase):
         self.assertNotIn("геоджасонки", text)
         self.assertIn("Горелый", text)  # спорная пара — не тронута
         self.assertIn("Sentinel-2", text)
+
+    def test_long_replica_split_into_paragraphs(self):
+        """Фаза 3: длинная реплика выходит абзацами через \\n, текст при этом
+        тот же; короткие реплики остаются однострочными."""
+        long_text = " ".join(
+            f"Предложение номер {i} достаточно длинное, чтобы набрать объём текста." for i in range(1, 21)
+        )
+        self.assertGreaterEqual(len(long_text), 1000)
+        with self.src.open("a", encoding="utf-8") as f:
+            f.write(f"\n[00:09:00] [SPEAKER_00] {long_text}\n")
+        proc = self.run_script(str(self.src), str(self.ctx),
+                               "-o", str(self.out), "--yes")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("фаза 3: 1 реплик", proc.stderr)
+
+        blocks = self.out.read_text().rstrip("\n").split("\n\n")
+        last = blocks[-1].splitlines()
+        self.assertTrue(last[0].startswith("[00:09:00] [Анна Соколова] Предложение номер 1 "))
+        self.assertEqual(len(last), 7)  # 20 предложений, абзац с 4, 7, …, 19
+        self.assertTrue(last[1].startswith("Предложение номер 4 "))
+        body = " ".join([last[0].split("] ", 2)[2], *last[1:]])
+        self.assertEqual(body, long_text)
+        self.assertTrue(all(len(b.splitlines()) == 1 for b in blocks[:-1]))
+
+    def add_long_replicas(self):
+        """Два длинных хвоста к фикстуре: вход набирает 2 чанка фазы 2,
+        маркер МАРКЕР попадает только во второй."""
+        filler = "Достаточно длинное предложение для объёма текста. " * 60
+        with self.src.open("a", encoding="utf-8") as f:
+            f.write(f"\n[00:09:00] [SPEAKER_00] {filler.strip()}\n")
+            f.write(f"\n[00:10:00] [SPEAKER_01] МАРКЕР. {filler.strip()}\n")
+
+    def calls(self, log: Path) -> list[str]:
+        out = log.read_text().splitlines() if log.exists() else []
+        log.unlink(missing_ok=True)
+        return out
+
+    def test_resume_after_phase2_failure_skips_done_work(self):
+        self.add_long_replicas()
+        log = Path(self.tmp.name) / "calls.log"
+        self.env["FAKE_CLAUDE_LOG"] = str(log)
+        parts = self.out.with_name(self.out.name + ".parts")
+
+        failed = self.run_script(str(self.src), str(self.ctx), "-o", str(self.out),
+                                 "--yes", "--workers", "1",
+                                 env_extra={"FAKE_CLAUDE_FAIL_MARK": "МАРКЕР"})
+        self.assertEqual(failed.returncode, 1)
+        self.assertFalse(self.out.exists())
+        self.assertIn("перезапуск той же командой", failed.stderr)
+        self.assertEqual(sorted(p.name for p in parts.iterdir()),
+                         ["clean-0001.json", "map.json"])
+        self.assertEqual(self.calls(log), ["map", "clean", "clean", "clean", "clean"])
+
+        resumed = self.run_script(str(self.src), str(self.ctx), "-o", str(self.out),
+                                  "--yes", "--workers", "1")
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        calls = self.calls(log)
+        self.assertNotIn("map", calls)
+        self.assertEqual(calls.count("clean"), 1)  # только упавший чанк
+        self.assertIn("карта взята из прошлого запуска", resumed.stderr)
+        self.assertIn("фаза 2: из прошлых запусков взято чанков: 1 из 2", resumed.stderr)
+        self.assertFalse(parts.exists())
+        # догадки из сохранённого чанка не потерялись
+        self.assertIn("'сентинел-данные' → 'Sentinel-2-данные'", resumed.stderr)
+
+        fresh = Path(self.tmp.name) / "fresh.txt"
+        full = self.run_script(str(self.src), str(self.ctx), "-o", str(fresh), "--yes")
+        self.assertEqual(full.returncode, 0, full.stderr)
+        self.assertEqual(self.out.read_text(), fresh.read_text())
+
+    def test_changed_context_file_invalidates_saved_work(self):
+        self.add_long_replicas()
+        log = Path(self.tmp.name) / "calls.log"
+        self.env["FAKE_CLAUDE_LOG"] = str(log)
+        failed = self.run_script(str(self.src), str(self.ctx), "-o", str(self.out),
+                                 "--yes", "--workers", "1",
+                                 env_extra={"FAKE_CLAUDE_FAIL_MARK": "МАРКЕР"})
+        self.assertEqual(failed.returncode, 1)
+        self.calls(log)
+
+        with self.ctx.open("a", encoding="utf-8") as f:
+            f.write("\nНовая строка глоссария.\n")
+        rerun = self.run_script(str(self.src), str(self.ctx), "-o", str(self.out),
+                                "--yes", "--workers", "1")
+        self.assertEqual(rerun.returncode, 0, rerun.stderr)
+        calls = self.calls(log)
+        self.assertEqual(calls.count("map"), 1)
+        self.assertEqual(calls.count("clean"), 2)
+        self.assertNotIn("из прошлых запусков", rerun.stderr)
 
     def test_guess_log_reaches_stderr(self):
         """Догадка мока проходит весь путь: ответ модели → журнал → stderr, и
