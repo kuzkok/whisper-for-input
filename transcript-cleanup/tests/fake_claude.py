@@ -6,17 +6,23 @@ SPEAKER_01 = Игорь Левин, остальные null — опоры addre
 meeting.txt), haiku → механические замены глоссария + точка в конец; замены из GUESSES
 дополнительно попадают в поле guesses (догадки без пары в контекст-файле);
 haiku с предложениями во входе → фаза 3: абзац с каждого третьего предложения
-(4, 7, 10, …).
+(4, 7, 10, …). Вызовы reader_pdf.py различаются по payload: «chapters» →
+привязка глав (из кандидатов выбирается абзац, где больше всего слов из
+названия главы; при равенстве — ближайший к оценке), «units» → разметка
+разделов (раздел с каждой четвёртой единицы, «Раздел N»).
 Формат envelope совпадает с реальным claude -p --output-format json.
 
 Управляется переменными окружения:
   FAKE_CLAUDE_LOG — файл, куда дописывается по строке на вызов: «map»,
-                    «clean» или «para»;
+                    «clean», «para», «anchor» или «sections»;
   FAKE_CLAUDE_FAIL_MARK — слово: чанк фазы 2, где оно встречается, получает
-                    ошибку вызова (rc 1, is_error).
+                    ошибку вызова (rc 1, is_error);
+  FAKE_CLAUDE_BAD_SECTIONS=1 — первая разметка разделов (по журналу
+                    FAKE_CLAUDE_LOG) возвращает номер вне диапазона.
 """
 import json
 import os
+import re
 import sys
 
 REPLACEMENTS = [
@@ -40,11 +46,27 @@ GUESSES = [
 ]
 
 
+def _stems(text: str) -> set[str]:
+    return {w[:5].lower() for w in re.findall(r"\w+", text) if len(w) > 3}
+
+
+def pick(chapter: dict) -> int:
+    title = _stems(chapter["title"])
+    return max(
+        chapter["paragraphs"],
+        key=lambda p: (len(title & _stems(p["text"])), -abs(p["i"] - chapter["estimate"])),
+    )["i"]
+
+
 def main() -> int:
     args = sys.argv[1:]
     model = args[args.index("--model") + 1]
     payload = json.loads(args[-1])
-    if model == "sonnet":
+    if "chapters" in payload:
+        kind = "anchor"
+    elif "units" in payload:
+        kind = "sections"
+    elif model == "sonnet":
         kind = "map"
     elif payload["replicas"] and "sentences" in payload["replicas"][0]:
         kind = "para"
@@ -59,7 +81,21 @@ def main() -> int:
         print(json.dumps({"is_error": True, "result": "simulated failure"}))
         return 1
 
-    if kind == "map":
+    if kind == "anchor":
+        out = {"anchors": [
+            {"n": ch["n"], "paragraph": pick(ch)} for ch in payload["chapters"]
+        ]}
+    elif kind == "sections":
+        n = len(payload["units"])
+        out = {"sections": [
+            {"start": i, "title": f"Раздел {k}"}
+            for k, i in enumerate(range(1, n + 1, 4), start=1)
+        ]}
+        first = sum(1 for line in open(log, encoding="utf-8") if line.strip() == "sections") == 1 \
+            if log else False
+        if os.environ.get("FAKE_CLAUDE_BAD_SECTIONS") == "1" and first:
+            out["sections"].append({"start": n + 10, "title": "Мимо"})
+    elif kind == "map":
         speakers = sorted({row["speaker"] for row in payload["skeleton"]})
         known = {
             "SPEAKER_00": (

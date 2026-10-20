@@ -239,7 +239,7 @@ def print_call_log() -> None:
             file=sys.stderr,
         )
     reported = any(c["cache_write"] or c["fresh"] for c in calls)
-    if reported and all(c["cache_read"] == 0 for c in calls[1:]):
+    if reported and len(calls) > 1 and all(c["cache_read"] == 0 for c in calls[1:]):
         print(
             "  кэш префикса не читался ни разу — прогрев первым чанком бесполезен, "
             "префикс переписывается на каждом вызове",

@@ -576,6 +576,22 @@ class CostCounterTests(unittest.TestCase):
         self.assertEqual(out, {"cleaned": ["текст"]})
         self.assertEqual(ct.spent_usd(), before)
 
+    def _log_output(self, calls: list[dict]) -> str:
+        err = io.StringIO()
+        with mock.patch.object(ct, "_calls", calls), mock.patch("sys.stderr", err):
+            ct.print_call_log()
+        return err.getvalue()
+
+    def test_cold_cache_warning_when_later_calls_never_read(self):
+        row = {"model": "haiku", "usd": 0.1, "cache_read": 0, "cache_write": 900, "fresh": 10}
+        self.assertIn("не читался", self._log_output([row, dict(row)]))
+
+    def test_no_cold_cache_warning_for_single_call(self):
+        """Одному вызову читать кэш не у кого — предупреждать не о чем
+        (reader_pdf делает ровно один вызов)."""
+        row = {"model": "haiku", "usd": 0.1, "cache_read": 0, "cache_write": 900, "fresh": 10}
+        self.assertNotIn("не читался", self._log_output([row]))
+
 
 class GuessLogTests(unittest.TestCase):
     """Журнал догадок: замены без пары в контекст-файле, о которых отчиталась модель."""
