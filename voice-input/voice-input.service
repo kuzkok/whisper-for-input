@@ -10,8 +10,9 @@ Requires=whisper-for-input.service
 
 [Service]
 Type=simple
-# KDE Wayland typically uses wayland-0; override via: systemctl --user edit voice-input
-Environment=WAYLAND_DISPLAY=wayland-0
+# WAYLAND_DISPLAY не задаём: номер сокета не фиксирован (wayland-0, wayland-1...),
+# а KDE при старте сессии импортирует актуальное значение в окружение
+# user-менеджера systemd, откуда его наследует сервис.
 ExecStart=/usr/bin/python3 %h/.local/bin/voice-input
 Restart=on-failure
 RestartSec=5
